@@ -1,0 +1,21 @@
+name = "airly"
+main = "worker.js"
+compatibility_date = "2026-08-01"
+
+# Required secret (set via: wrangler secret put AQICN_TOKEN)
+#   AQICN_TOKEN — free token from https://aqicn.org/data-platform/token/
+
+# --- Optional: AI advisories ---
+[ai]
+binding = "AI"
+
+# --- Optional: background push (uncomment after creating the namespace) ---
+# Run: wrangler kv namespace create PUSH_SUBS   and paste the id below.
+# [[kv_namespaces]]
+# binding = "PUSH_SUBS"
+# id = "REPLACE_WITH_YOUR_NAMESPACE_ID"
+
+# Also set secrets: VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY, (optional) VAPID_SUBJECT
+
+[triggers]
+crons = ["0,30 * * * *"]
