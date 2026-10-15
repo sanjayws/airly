@@ -62,7 +62,9 @@ test('independent map snapshots cannot be overwritten by delayed area responses'
  expect(await page.evaluate(()=>viewportStations[0].name)).toBe('New viewport');
 });
 test('high latitude and antimeridian viewport requests cover the visible map',async({page})=>{
- await page.goto('https://airly.test/');await expect.poll(()=>page.evaluate(()=>!!map)).toBe(true);
+ // Finish the initial GPS centering before deliberately moving the map.
+ await page.emulateMedia({reducedMotion:'reduce'});
+ await page.goto('https://airly.test/');await expect.poll(()=>page.evaluate(()=>!!map&&!locationStarting&&!!current?.detail)).toBe(true);
  const urls=await page.evaluate(async()=>{
   const calls=[],original=requestJSON;requestJSON=async path=>{calls.push(path);return []};
   map.setView([70,20],10,{animate:false});await loadViewport(true);
