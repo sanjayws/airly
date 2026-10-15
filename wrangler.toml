@@ -1,13 +1,22 @@
 name = "airly"
+account_id = "c5cc3f600a44c74d72518d91a320f828"
 main = "worker.js"
 compatibility_date = "2026-08-01"
 
 # Required secret (set via: wrangler secret put AQICN_TOKEN)
 #   AQICN_TOKEN — free token from https://aqicn.org/data-platform/token/
 
-# --- Optional: AI advisories ---
-[ai]
-binding = "AI"
+# AI guidance was retired; the dashboard uses deterministic category guidance.
+
+[[ratelimits]]
+name = "PUSH_LIMIT"
+namespace_id = "912632601"
+simple = { limit = 10, period = 60 }
+
+[[ratelimits]]
+name = "PUSH_BUDGET"
+namespace_id = "912632602"
+simple = { limit = 100, period = 60 }
 
 # --- Optional: background push (uncomment after creating the namespace) ---
 # Run: wrangler kv namespace create PUSH_SUBS   and paste the id below.
@@ -19,3 +28,10 @@ binding = "AI"
 
 [triggers]
 crons = ["0,30 * * * *"]
+
+[observability]
+enabled = true
+
+[observability.traces]
+enabled = true
+head_sampling_rate = 0.05

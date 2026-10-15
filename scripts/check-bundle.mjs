@@ -1,0 +1,10 @@
+import assert from 'node:assert/strict';
+import source from '../worker.js';
+import bundle from '../dist/worker.js';
+const request = new Request('https://airly.test/');
+const original = await (await source.fetch(request, {}, {})).text();
+const deployed = await (await bundle.fetch(request, {}, {})).text();
+assert.equal(deployed, original, 'Wrangler must preserve the complete frontend HTML');
+const config=new Request('https://airly.test/api/config');
+assert.deepEqual(await (await bundle.fetch(config,{},{})).json(),await (await source.fetch(config,{},{})).json(),'Deploy the tested release identity and configuration');
+console.log('Bundled Worker serves the complete app ('+deployed.length+' characters).');

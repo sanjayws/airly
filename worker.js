@@ -20,16 +20,24 @@
  * trend/forecast, 4-language UI (EN/BM/TA/ZH) and background Web Push.
  *
  * Required:  secret AQICN_TOKEN
- * Optional:  [ai] binding = "AI"                      -> AI advisories (else static advice)
  *            KV binding PUSH_SUBS + VAPID_* secrets
  *              + [triggers] crons = ["0,30 * * * *"]  -> background push (else in-page alerts)
  *
- * NOTE: do not minify — the frontend lives in the HTML_SOURCE function comment.
+ * Frontend HTML is a template string so Wrangler preserves it when bundling.
  * Audited edition: official Malaysia API auto-selection, strict US AQI units elsewhere.
  * Malaysia uses the public DOE APIMS feed; no extra token or binding is needed.
- * AI advice endpoint is retained for compatibility; primary guidance is deterministic.
- * Required secret remains AQICN_TOKEN. Deploy this file as-is, without minifying.
+ * Health guidance is deterministic; the former AI endpoint is retired.
+ * Required secret remains AQICN_TOKEN. Supports Wrangler bundling.
  */
+
+import {HTML_SOURCE} from './ui/app.js';
+import {countryAt} from './lib/geo.js';
+import {normalizeWaqi, measurementTime, WAQI_METHOD} from './lib/air-quality.js';
+import {alertTransition} from './lib/alerts.js';
+import alertSource from './data/alert-source.js';
+import release from './data/release.js';
+import {leafletJS, leafletCSS} from './data/leaflet.js';
+const logFailure = (route, code) => console.warn(JSON.stringify({event:'request_failure',route,code}));
 
 const SEA_BOUNDS = '-11,92,29,141';
 const SW_JS = "self.addEventListener('install',()=>self.skipWaiting());self.addEventListener('activate',e=>e.waitUntil(self.clients.claim()));self.addEventListener('notificationclick',e=>{e.notification.close();e.waitUntil(self.clients.matchAll({type:'window'}).then(c=>c[0]?c[0].focus():self.clients.openWindow('/')))});self.addEventListener('push',e=>{let d={};try{d=e.data.json()}catch{}e.waitUntil(self.registration.showNotification(d.title||'Airly',{body:d.body||''}))});";
@@ -49,15 +57,15 @@ export default {
     if (url.pathname === '/manifest.webmanifest') return new Response(JSON.stringify({ id: '/', scope: '/', name: 'Airly by Ordinexis', short_name: 'Airly', description: 'Live air quality worldwide', start_url: '/', display: 'standalone', background_color: '#f6f2e9', theme_color: '#f6f2e9', icons: [{ src: '/icon-180.png', sizes: '180x180', type: 'image/png' }, { src: '/logo.png', sizes: '256x256', type: 'image/png' }] }), { headers: { 'content-type': 'application/manifest+json', 'cache-control': 'public, max-age=86400', 'x-content-type-options': 'nosniff' } });
     if (url.pathname === '/sw.js') return new Response(SW_JS, { headers: { 'content-type': 'text/javascript; charset=UTF-8', 'cache-control': 'no-cache', 'x-content-type-options': 'nosniff' } });
     if (url.pathname === '/vendor/leaflet.js' || url.pathname === '/vendor/leaflet.css') return vendor(url.pathname);
-    if (url.pathname === '/api/config') return json({ backgroundPush: pushReady(env) });
+    if (url.pathname === '/api/config') return json({ backgroundPush: pushReady(env), release });
     if (url.pathname === '/api/air') return air(request, env);
     if (url.pathname === '/api/search') return searchStations(request);
-    if (url.pathname === '/api/advice') return aiAdvice(request, env, ctx);
+    if (url.pathname === '/api/advice') return json({error:'AI advice has been retired. Use the dashboard category guidance.',code:'RETIRED'},410);
     if (url.pathname === '/api/location') return location(request);
     if (url.pathname === '/api/news') return news(request, ctx);
     if (url.pathname === '/' || url.pathname === '/index.html') {
       return new Response(HTML.replaceAll('__ORIGIN__', url.origin), { headers: {
-        'content-type': 'text/html; charset=UTF-8', 'cache-control': 'no-cache',
+        'content-type': 'text/html; charset=UTF-8', 'cache-control': 'no-cache', 'x-airly-release':release,
         'content-security-policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://tile.openstreetmap.org; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
         'permissions-policy': 'geolocation=(self), camera=(), microphone=()', 'referrer-policy': 'strict-origin-when-cross-origin',
         'x-content-type-options': 'nosniff', 'x-frame-options': 'DENY'
@@ -88,10 +96,16 @@ async function fetchJson(endpoint, cf) {
 }
 
 function location(request) {
+  const p = new URL(request.url).searchParams;
+  if (p.has('lat') || p.has('lon')) {
+    const lat=number(p.get('lat')),lon=number(p.get('lon'));
+    if(lat===null||lon===null||Math.abs(lat)>90||Math.abs(lon)>180)return json({error:'Invalid coordinates'},400);
+    return json({lat,lon,country:countryAt(lat,lon),source:'coordinates'});
+  }
   const cf = request.cf || {};
   const lat = number(cf.latitude), lon = number(cf.longitude);
-  if (lat === null || lon === null) return json({ error: 'IP location unavailable' }, 404);
-  return json({ lat, lon, city: cf.city || '', region: cf.region || '', country: cf.country || '' });
+  if (lat === null || lon === null || Math.abs(lat)>90 || Math.abs(lon)>180) return json({ error: 'IP location unavailable' }, 404);
+  return json({ lat, lon, city: cf.city || '', region: cf.region || '', country: cf.country || '', source: 'ip', approximate: true });
 }
 
 async function air(request, env) {
@@ -99,16 +113,17 @@ async function air(request, env) {
   if (p.has('index') && !['auto','my','us'].includes(p.get('index'))) return json({ error: 'Invalid index' }, 400);
   if (p.has('country') && !/^[A-Z]{2}$/.test(p.get('country'))) return json({ error: 'Invalid country' }, 400);
   // Station identity pins the provider: never change scales mid-refresh or alert.
-  const malaysia = uid ? /^my:/.test(uid) : p.get('index') === 'my' || (p.get('index') !== 'us' && (p.get('country') || request.cf?.country) === 'MY');
+  const lat=number(p.get('lat')),lon=number(p.get('lon')),bounds=p.get('bbox')?.split(',').map(number);
+  if((p.has('lat')||p.has('lon'))&&(lat===null||lon===null||Math.abs(lat)>90||Math.abs(lon)>180))return json({error:'Invalid coordinates'},400);
+  const coordinateCountry=lat!==null&&lon!==null?countryAt(lat,lon):bounds?.length===4&&bounds.every(x=>x!==null)?countryAt((bounds[0]+bounds[2])/2,(bounds[1]+bounds[3])/2):null;
+  const country=coordinateCountry??p.get('country')??request.cf?.country;
+  const malaysia = uid ? /^my:/.test(uid) : p.get('index') === 'my' || (p.get('index') !== 'us' && country === 'MY');
   return malaysia ? malaysiaAir(request, env) : waqiAir(request, env);
 }
 
 const MY_FEED = 'https://eqms.doe.gov.my/api3/publicmapproxy/PUBLIC_DISPLAY/CAQM_MCAQM_Current_Reading/MapServer/0/query?where=1%3D1&outFields=STATION_ID,DATETIME,API,PARAM_SELECTED,STATION_LOCATION,LONGITUDE,LATITUDE&returnGeometry=false&f=json';
-let malaysiaPending = null;
 async function malaysiaStations() {
-  // Coalesce concurrent map/detail reads; only public station data is edge-cached.
-  if (malaysiaPending) return malaysiaPending;
-  malaysiaPending = (async () => {
+  // Cache public station data at the edge; each request owns its upstream promise.
     const result = await fetchJson(MY_FEED, { cacheTtl: 120, cacheEverything: true });
     if (result.error || !Array.isArray(result.features) || result.exceededTransferLimit) throw Error('DOE feed unavailable');
     const fetchedAt = new Date().toISOString();
@@ -119,7 +134,7 @@ async function malaysiaStations() {
       const time = stamp !== null && stamp > 0 && stamp < 8640000000000000 ? new Date(stamp).toISOString().replace('Z', '+08:00') : null;
       return {
         uid: 'my:' + String(a.STATION_ID || ''), stationCode: String(a.STATION_ID || ''),
-        provider: 'doe', index: 'my', name: String(a.STATION_LOCATION || 'DOE monitoring station'),
+        provider: 'doe', index: 'my', calculation: 'doe-official-api', name: String(a.STATION_LOCATION || 'DOE monitoring station'),
         aqi: validAqi(a.API), lat: number(a.LATITUDE), lon: number(a.LONGITUDE), time,
         fetchedAt, timezone: '+08:00', dominant: a.PARAM_SELECTED || null,
         pm25: null, pm10: null, pollutants: {}, humidity: null, wind: null, temperature: null,
@@ -130,8 +145,6 @@ async function malaysiaStations() {
     }).filter(s => /^my:[A-Z0-9_-]{1,20}$/.test(s.uid) && s.aqi !== null && s.lat !== null && s.lon !== null && Math.abs(s.lat) <= 90 && Math.abs(s.lon) <= 180);
     if (!stations.length) throw Error('No valid DOE readings');
     return stations;
-  })();
-  try { return await malaysiaPending; } finally { malaysiaPending = null; }
 }
 function stationDistance(lat, lon, s) {
   const r = Math.PI / 180, h = Math.sin((s.lat-lat)*r/2)**2 + Math.cos(lat*r)*Math.cos(s.lat*r)*Math.sin((s.lon-lon)*r/2)**2;
@@ -154,9 +167,9 @@ async function malaysiaAir(request, env) {
     if (!station) return json({ error: 'This DOE station has no available API reading', code: 'NO_READING' }, 502);
     // IP country can be wrong (e.g. a VPN). Never imply a distant Malaysian station
     // measures air at a GPS position on another continent.
-    if (!uid && lat !== null && stationDistance(lat,lon,station)>200) return waqiAir(request, env);
+    if (!uid && lat !== null && stationDistance(lat,lon,station)>200) return json({error:'No Malaysia API station covers this area. Select US AQI for worldwide stations.',code:'NO_COVERAGE'},422);
     return json(station);
-  } catch { return json({ error: 'Malaysia DOE API readings are temporarily unavailable. Try again or select US AQI in settings.', code: 'DOE_UNAVAILABLE' }, 502); }
+  } catch { logFailure('air','DOE_UNAVAILABLE'); return json({ error: 'Malaysia DOE API readings are temporarily unavailable. Try again or select US AQI in settings.', code: 'DOE_UNAVAILABLE' }, 502); }
 }
 
 async function waqiAir(request, env) {
@@ -178,116 +191,35 @@ async function waqiAir(request, env) {
       }
       const result = await fetchJson('https://api.waqi.info/v2/map/bounds?latlng='+bounds+'&networks=all&token='+encodeURIComponent(env.AQICN_TOKEN));
       if (result.status !== 'ok' || !Array.isArray(result.data)) throw new Error('unavailable');
-      return json(result.data.map(s => ({
-        uid: number(s.uid), provider: 'waqi', index: 'us', name: String(s.station?.name || 'Monitoring station'), aqi: validAqi(s.aqi),
-        lat: number(s.lat), lon: number(s.lon), time: s.station?.time || null
-      })).filter(s => s.uid > 0 && s.aqi !== null && s.lat !== null && s.lon !== null && Math.abs(s.lat)<=90 && Math.abs(s.lon)<=180));
+      // Bounds feeds have no pollutant sub-indices or reliable timezone. They
+      // locate stations; their headline numbers cannot be trusted as US AQI.
+      const bb=bounds.split(',').map(Number),center=[(bb[0]+bb[2])/2,(bb[1]+bb[3])/2];
+      const stations=result.data.map(s=>({uid:number(s.uid),provider:'waqi',index:'us',name:String(s.station?.name||'Monitoring station'),
+        aqi:null,lat:number(s.lat),lon:number(s.lon),time:null,detail:false,calculation:'unverified-summary'}))
+        .filter(s=>Number.isSafeInteger(s.uid)&&s.uid>0&&s.lat!==null&&s.lon!==null&&Math.abs(s.lat)<=90&&Math.abs(s.lon)<=180)
+        .sort((a,b)=>stationDistance(...center,a)-stationDistance(...center,b));
+      // Bounded fan-out: 1 bounds + at most 12 detail requests, including failures.
+      // Other stations remain selectable neutral pins; never invent their AQI.
+      await Promise.all(stations.slice(0,12).map(async(s,i)=>{
+        try{stations[i]=await waqiStation('@'+s.uid,env,s.uid)}catch{/* keep neutral station */}
+      }));
+      return json(stations);
     }
     // Preserve coordinates for station matching. No artificial kilometre rounding.
     const target = uid ? '@'+uid : lat !== null ? 'geo:'+lat+';'+lon : 'geo:3.139;101.687';
-    const result = await fetchJson('https://api.waqi.info/feed/'+target+'/?token='+encodeURIComponent(env.AQICN_TOKEN));
-    if (result.status !== 'ok' || !result.data) throw new Error('unavailable');
-    const d = result.data, stamp = d.time?.iso || (d.time?.s && /^[+-]\d{2}:\d{2}$/.test(d.time?.tz||'') ? d.time.s.replace(' ','T')+d.time.tz : null);
-    const aqi = validAqi(d.aqi);
-    if (aqi === null) return json({ error: 'This station has no valid AQI reading', code: 'NO_READING' }, 502);
-    const value = key => number(d.iaqi?.[key]?.v);
-    return json({
-      uid: number(d.idx), provider: 'waqi', index: 'us', name: String(d.city?.name || 'Monitoring station'), aqi,
-      lat: number(d.city?.geo?.[0]), lon: number(d.city?.geo?.[1]), time: stamp,
-      fetchedAt: new Date().toISOString(), timezone: d.time?.tz || /[+-]\d{2}:\d{2}$/.exec(stamp || '')?.[0] || null, dominant: d.dominentpol || null,
-      pm25: validAqi(value('pm25')), pm10: validAqi(value('pm10')),
-      pollutants: Object.fromEntries(['pm25','pm10','o3','no2','so2','co'].map(k=>[k,validAqi(value(k))])),
-      humidity: value('h') !== null && value('h') >= 0 && value('h') <= 100 ? value('h') : null,
-      wind: value('w') !== null && value('w') >= 0 ? value('w') : null, temperature: value('t'),
-      units: { pollutants: 'US AQI sub-index', wind: 'm/s', temperature: '°C', humidity: '%' },
-      forecast: (d.forecast?.daily?.pm25 || []).filter(x=>/^\d{4}-\d{2}-\d{2}$/.test(x.day)).map(x=>({day:x.day,avg:validAqi(x.avg),min:validAqi(x.min),max:validAqi(x.max)})).filter(x=>x.avg !== null).slice(-8),
-      attribution: (d.attributions || []).filter(x=>/^https?:\/\//i.test(x.url||'')).map(x=>({name:String(x.name||'Data provider'),url:x.url})),
-      stationUrl: /^https?:\/\//i.test(d.city?.url||'') ? d.city.url : null
-    });
-  } catch { return json({ error: 'Air quality data is temporarily unavailable', code: 'UPSTREAM_UNAVAILABLE' }, 502); }
+    const station=await waqiStation(target,env,uid);
+    if(!uid&&lat!==null&&stationDistance(lat,lon,station)>200)return json({error:'No nearby station reading is available for these coordinates',code:'NO_COVERAGE'},422);
+    return json(station);
+  } catch { logFailure('air','UPSTREAM_UNAVAILABLE'); return json({ error: 'Air quality data is temporarily unavailable', code: 'UPSTREAM_UNAVAILABLE' }, 502); }
+}
+async function waqiStation(target,env,uid=null) {
+  const result=await fetchJson('https://api.waqi.info/feed/'+target+'/?token='+encodeURIComponent(env.AQICN_TOKEN));
+  if(result.status!=='ok'||!result.data)throw Error('Unavailable station');
+  return normalizeWaqi(result.data,uid);
 }
 const validAqi = value => { const n = number(value); return n !== null && n >= 0 ? n : null; };
 
-/**
- * AI-written health guidance via Workers AI (requires [ai] binding = "AI" in wrangler.toml).
- * Free-tier friendly: results cached 15 min per ~1km location bucket + language, so a busy
- * city costs a handful of inferences per hour. Any failure — no binding, no token, quota
- * exhausted, rate limit, timeout — returns {fallback:true} and the client keeps static text.
- * On the Workers Free plan, exhausting the free allocation makes AI.run throw (never bills).
- */
-async function aiAdvice(request, env, ctx) {
-  if (!env.AI || !env.AQICN_TOKEN) return json({ fallback: true }, 200, 'public, max-age=300');
-  const url = new URL(request.url);
-  const lat = clamp(number(url.searchParams.get('lat')), -90, 90);
-  const lon = clamp(number(url.searchParams.get('lon')), -180, 180);
-  const langCode = ['en','ms','ta','zh'].includes(url.searchParams.get('lang')) ? url.searchParams.get('lang') : 'en';
-  const language = ({ en:'English', ms:'Bahasa Melayu (Malay)', ta:'Tamil', zh:'Simplified Chinese' })[langCode];
-  // Script check so a model that ignores the language instruction falls through to the next tier.
-  const langOk = text => langCode === 'ta' ? /[஀-௿]/.test(text) : langCode === 'zh' ? /[一-鿿]/.test(text) : true;
-  const sensitive = url.searchParams.get('sensitive') === '1';
-  const target = lat !== null && lon !== null ? `geo:${lat.toFixed(2)};${lon.toFixed(2)}` : 'geo:3.139;101.687';
-  const cache = caches.default;
-  try {
-    const feed = await fetchJson(`https://api.waqi.info/feed/${target}/?token=${encodeURIComponent(env.AQICN_TOKEN)}`, { cacheTtl: 120, cacheEverything: true });
-    if (feed.status !== 'ok' || !feed.data || !Number.isFinite(Number(feed.data.aqi))) throw new Error('no data');
-    const d = feed.data;
-    // Cache key includes the EPA band AND the AQI decade bucket: a band crossing or a ~10+ unit
-    // swing yields a fresh generation; small wobbles keep hitting the cached text.
-    const aqiNow = Number(d.aqi);
-    const bandIdx = aqiNow <= 50 ? 0 : aqiNow <= 100 ? 1 : aqiNow <= 150 ? 2 : aqiNow <= 200 ? 3 : aqiNow <= 300 ? 4 : 5;
-    const key = new Request(`https://airly-cache.local/advice/v6/${encodeURIComponent(target)}/${encodeURIComponent(language)}/${sensitive ? 's' : 'n'}/${bandIdx}-${Math.round(aqiNow / 10)}`);
-    const cached = await cache.match(key); if (cached) return cached;
-    const fc = (d.forecast?.daily?.pm25 || []).slice(0, 3).map(x => `${x.day} avg PM2.5 ${x.avg}`).join(', ');
-    // Reuse the news cache if it happens to be warm (never triggers new feed fetches).
-    let headlines = '';
-    try {
-      const cc = /^[A-Z]{2}$/.test((request.cf || {}).country || '') ? request.cf.country : 'MY';
-      const newsHit = await cache.match(new Request(`https://airly-cache.local/news/v4/${cc}/${encodeURIComponent((request.cf || {}).region || 'all')}`));
-      if (newsHit) headlines = (await newsHit.json()).slice(0, 2).map(x => x.title).join(' | ');
-    } catch { /* headlines are optional */ }
-    // Deterministic band verdict — computed above from the official US EPA AQI table,
-    // not left to the model to classify. Descriptions and cautionary statements are the
-    // EPA's own (PM2.5 cautionary statements, AirNow.gov).
-    const bands = [
-      ['Good (0-50)', 'EPA: Air quality is satisfactory, and air pollution poses little or no risk. Cautionary statement: none — it is a good time to be active outside. Airing rooms is fine.'],
-      ['Moderate (51-100)', 'EPA: Air quality is acceptable; there may be a risk only for people unusually sensitive to air pollution. Cautionary statement: unusually sensitive people should consider reducing prolonged or heavy exertion; EVERYONE ELSE can be active outside as normal. Do NOT tell the general public to avoid going outside, stay indoors, or wear masks — the EPA does not recommend that in this band.'],
-      ['Unhealthy for Sensitive Groups (101-150)', 'EPA: Members of sensitive groups (heart or lung disease, asthma, older adults, children) may experience health effects; the general public is less likely to be affected. Cautionary statement: sensitive groups should reduce prolonged or heavy exertion — it is OK for them to be active outside with more breaks; the general public can continue normal activity. Keep windows closed; filtration helps.'],
-      ['Unhealthy (151-200)', 'EPA: Some of the general public may experience health effects; sensitive groups may experience more serious effects. Cautionary statement: sensitive groups avoid prolonged or heavy exertion; everyone else reduce prolonged or heavy exertion. A well-fitted mask (e.g. N95) outdoors is reasonable; keep windows closed and use filtration.'],
-      ['Very Unhealthy (201-300)', 'EPA health alert: the risk of health effects is increased for everyone. Cautionary statement: sensitive groups avoid all outdoor physical activity; everyone else avoid prolonged or heavy exertion. Stay indoors where possible with windows closed and filtration running; wear a well-fitted mask if going out.'],
-      ['Hazardous (301+)', 'EPA health warning of emergency conditions. Cautionary statement: everyone avoid all outdoor physical activity; remain indoors, keep windows sealed, run filtration.']
-    ];
-    const band = bands[bandIdx];
-    const prompt = `You are a cautious air-quality health advisor who follows the official US EPA Air Quality Index guidance exactly. The current US AQI is ${aqiNow}, which the EPA table classifies as "${band[0]}". Official EPA guidance for this category — your advice MUST agree with it, neither more relaxed nor more alarming: ${band[1]} Additional rules you must never break: the current absolute AQI decides safety — never judge safety by comparing to the forecast; if AQI is above 100, never suggest opening windows or unfiltered ventilation; only suggest airing rooms when AQI is 100 or below, and never describe opening windows as a way to minimize or reduce exposure — ventilation brings outdoor air in, it only helps against indoor-generated pollutants; when AQI is above 80, prefer filtration tips over ventilation tips; use only the data provided, never invent numbers.
-Interpretation rails for the other variables — use them only to add nuance (comfort, heat, dispersal), NEVER to change the EPA band stance above: pollutant sub-indices are each on the same AQI bands (0-50 good, 51-100 moderate, 101-150 unhealthy for sensitive groups, and so on) — the dominant pollutant is the one driving the overall AQI, and a pollutant whose sub-index sits in a lower band than the overall AQI is not a concern worth mentioning. Temperature C: below 20 cool, 20-27 comfortable, 27-33 hot (hydrate during exertion), above 33 very hot (heat stress risk — prefer morning/evening exertion). Humidity %: below 30 dry, 30-60 comfortable, 60-80 humid, above 80 very humid (exertion feels harder; combined with heat, add heat caution). Wind m/s: below 1 calm (pollution tends to linger), 1-4 light, 4-8 moderate (helps disperse pollution), above 8 strong (disperses pollution quickly — conditions may improve ahead of the forecast).
-Data — air quality near ${d.city?.name || 'the user'}: US AQI ${d.aqi}, dominant pollutant ${d.dominentpol || 'n/a'}; pollutant sub-indices (AQI units) — PM2.5 ${d.iaqi?.pm25?.v ?? 'n/a'}, PM10 ${d.iaqi?.pm10?.v ?? 'n/a'}, ozone ${d.iaqi?.o3?.v ?? 'n/a'}, NO2 ${d.iaqi?.no2?.v ?? 'n/a'}, SO2 ${d.iaqi?.so2?.v ?? 'n/a'}, CO ${d.iaqi?.co?.v ?? 'n/a'}; weather — temperature ${d.iaqi?.t?.v ?? 'n/a'}C, humidity ${d.iaqi?.h?.v ?? 'n/a'}%, wind ${d.iaqi?.w?.v ?? 'n/a'} m/s. PM2.5 forecast: ${fc || 'unavailable'}. Ignore any value marked n/a.${headlines ? ` Recent local headlines: ${headlines}.` : ''}
-Task: write practical guidance for a resident${sensitive ? ' with a sensitive health profile (asthma, heart or lung conditions)' : ''} right now: exactly 2 short sentences, at most 40 words total, plain text, no preamble, no lists. Cover whether to go outside now, plus one concrete everyday tip (exercise timing, commuting, ventilation, masks, or indoor air) consistent with the rules above. Mention the trend only as trend, never as a reason to relax precautions. Respond ONLY in ${language} — every word of the reply must be in ${language}.`;
-    // Newest suitable model first (fast MoE, strong multilingual), older model as backup.
-    const MODELS = ['@cf/qwen/qwen3-30b-a3b-fp8', '@cf/meta/llama-3.2-3b-instruct'];
-    let text = '';
-    for (const model of MODELS) {
-      try {
-        const ai = await Promise.race([
-          env.AI.run(model, { messages: [{ role: 'user', content: prompt }], max_tokens: 220 }),
-          new Promise((_, reject) => setTimeout(() => reject(new Error('ai timeout')), UPSTREAM_TIMEOUT))
-        ]);
-        text = String(ai?.response || ai?.output_text || '')
-          .replace(/<think>[\s\S]*?<\/think>/gi, '') // Qwen3 reasoning blocks
-          .replace(/\s+/g, ' ').trim().slice(0, 320);
-        // Reject contradictory ventilation advice when the air is bad (en/ms/zh/ta patterns).
-        const badVent = aqiNow > 100 && /open(?:ing|ed)?\s+(?:the\s+|your\s+|some\s+)?windows?|windows?\s+open|membuka\s+tingkap|buka(?:kan)?\s+tingkap|开窗|打开窗|开着窗|ஜன்னல்[^.]{0,20}திற/i.test(text);
-        // Reject over-alarming advice when the air is good/moderate (mirror guard).
-        const overAlarm = aqiNow <= 100 && /avoid\s+(?:going\s+)?out|stay\s+indoors?|do\s+not\s+go\s+out|\bN95\b|\bunhealthy\b|elakkan\s+keluar|kekal\s+di\s+dalam|tidak\s+sihat|避免外出|留在室内|不健康|வெளியே\s+செல்ல\s+வேண்டாம்|ஆரோக்கியமற்ற/i.test(text);
-        const minLen = langCode === 'zh' ? 10 : 20; // CJK says more per character
-        if (text.length >= minLen && langOk(text) && !badVent && !overAlarm) break; text = '';
-      } catch { /* try next model */ }
-    }
-    if (!text) throw new Error('no ai output');
-    // Browser holds advice max 2 min; the edge keeps it 15 min (s-maxage) for free-tier economy.
-    const response = json({ advice: text }, 200, 'public, max-age=120, s-maxage=900');
-    ctx.waitUntil(cache.put(key, response.clone()));
-    return response;
-  } catch { return json({ fallback: true }, 200, 'no-store'); }
-}
+
 
 // City finder: Open-Meteo geocoding (free, keyless), proxied so the client stays same-origin.
 // Picking a city then rides the normal nearest-station flow (geo feed) to home in on a reading.
@@ -299,24 +231,12 @@ async function searchStations(request) {
   try {
     const result = await fetchJson(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(q)}&count=8&language=${langP}&format=json`, { cacheTtl: 86400, cacheEverything: true });
     return json((result.results || []).map(x => ({ name: x.name, country: x.country_code || '', region: [x.admin1, x.country].filter(Boolean).join(', '), lat: number(x.latitude), lon: number(x.longitude) })).filter(x => x.name && x.lat !== null && x.lon !== null).slice(0, 8), 200, 'public, max-age=86400');
-  } catch { return json([], 200, 'public, max-age=120'); }
+  } catch { logFailure('search','UPSTREAM_UNAVAILABLE'); return json({error:'City search is temporarily unavailable',code:'UPSTREAM_UNAVAILABLE'},503); }
 }
 
-async function vendor(pathname) {
-  const isJs = pathname.endsWith('.js');
-  const file = isJs ? 'leaflet.js' : 'leaflet.css';
-  const sources = [
-    `https://unpkg.com/leaflet@1.9.4/dist/${file}`,
-    `https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/${file}`
-  ];
-  for (const source of sources) {
-    try {
-      const upstream = await fetch(source, { cf: { cacheTtl: 86400, cacheEverything: true }, signal: AbortSignal.timeout(UPSTREAM_TIMEOUT) });
-      if (!upstream.ok) continue;
-      return new Response(upstream.body, { headers: { 'content-type': isJs ? 'text/javascript; charset=UTF-8' : 'text/css; charset=UTF-8', 'cache-control': 'public, max-age=86400, immutable', 'x-content-type-options': 'nosniff' } });
-    } catch { /* try next source */ }
-  }
-  return new Response('Map library unavailable', { status: 502 });
+function vendor(pathname) {
+  const js=pathname.endsWith('.js');
+  return new Response(js?leafletJS:leafletCSS,{headers:{'content-type':js?'text/javascript; charset=UTF-8':'text/css; charset=UTF-8','cache-control':'public, max-age=86400','x-content-type-options':'nosniff'}});
 }
 
 async function news(request, ctx) {
@@ -324,13 +244,14 @@ async function news(request, ctx) {
   const fresh = reqUrl.searchParams.get('fresh') === '1';
   const cf = request.cf || {};
   const requested = reqUrl.searchParams.get('locale');
-  const country = requested && requested !== 'AUTO' && /^[A-Z]{2}$/.test(requested) ? requested : (/^[A-Z]{2}$/.test(cf.country || '') ? cf.country : 'MY');
+  const resolved=reqUrl.searchParams.get('location')==='resolved';
+  const country = requested && requested !== 'AUTO' && /^[A-Z]{2}$/.test(requested) ? requested : resolved?'':(/^[A-Z]{2}$/.test(cf.country || '') ? cf.country : '');
   let countryName = country; try { countryName = new Intl.DisplayNames(['en'], { type: 'region' }).of(country) || country } catch {}
   const isSea = { MY:1, SG:1, ID:1, TH:1, VN:1, PH:1, BN:1, KH:1, LA:1, MM:1, TL:1 }[country];
   const city = (reqUrl.searchParams.get('city') || '').replace(/[\u0000-\u001f]/g,'').trim().slice(0,80);
-  const localArea = city || ((!requested || requested === 'AUTO' || country === cf.country) ? (cf.city || cf.region || '') : '');
+  const localArea = city || (!resolved&&(!requested || requested === 'AUTO' || country === cf.country) ? (cf.city || cf.region || '') : '');
   const cache = caches.default;
-  const key = new Request(`https://airly-cache.local/news/v5/${country}/${encodeURIComponent(localArea || 'all')}`);
+  const key = new Request(`https://airly-cache.local/news/v6/${country}/${encodeURIComponent(localArea || 'all')}`);
   if (!fresh) { const cached = await cache.match(key); if (cached) { const response=new Response(cached.body,cached); response.headers.set('cache-control','private, max-age=900'); return response; } }
   try {
     // Decode &amp; LAST so "&amp;lt;" doesn't become "<"; strip tags before entity decode.
@@ -338,25 +259,33 @@ async function news(request, ctx) {
     const tag = (xml, name) => decode(xml.match(new RegExp(`<${name}[^>]*>([\\s\\S]*?)<\\/${name}>`, 'i'))?.[1]);
     const scopes = [
       localArea ? { label:'Near you', query:`air quality haze PM2.5 ${localArea} ${countryName}` } : null,
-      { label:countryName, query:`air quality haze PM2.5 ${countryName}` },
+      country ? { label:countryName, query:`air quality haze PM2.5 ${countryName}` } : null,
       isSea ? { label:'Southeast Asia', query:'air quality haze PM2.5 Southeast Asia' } : null,
       { label:'Global', query:'air quality pollution wildfire smoke global' }
     ].filter(Boolean);
     const market = ({ MY:'en-MY', SG:'en-SG', ID:'id-ID', TH:'th-TH', VN:'vi-VN', PH:'en-PH', US:'en-US', GB:'en-GB', IN:'en-IN', AU:'en-AU', CN:'zh-CN', TW:'zh-TW', HK:'zh-HK', JP:'ja-JP', KR:'ko-KR', DE:'de-DE', FR:'fr-FR' })[country] || 'en-US';
-    const feeds = (await Promise.allSettled(scopes.map(async scope => {
+    const results = await Promise.allSettled(scopes.map(async scope => {
       const rssUrl = `https://www.bing.com/news/search?q=${encodeURIComponent(scope.query)}&format=rss&mkt=${market}&qft=${encodeURIComponent('sortbydate="1"')}`;
       const response = await fetch(rssUrl, { headers:{ 'user-agent':'Airly/1.0 (+https://www.ordinexis.com) RSS reader' }, cf:{ cacheTtl:900, cacheEverything:true }, signal: AbortSignal.timeout(UPSTREAM_TIMEOUT) });
-      if (!response.ok) return [];
+      if (!response.ok) throw Error('news source unavailable');
       const rss = await response.text();
+      if(!/<rss[\s>]|<channel[\s>]/i.test(rss))throw Error('invalid RSS');
       return [...rss.matchAll(/<item>([\s\S]*?)<\/item>/gi)].map(m => ({ title:tag(m[1],'title'), link:tag(m[1],'link'), source:`${scope.label} · ${tag(m[1],'News:Source') || tag(m[1],'source') || 'News'}`, published:tag(m[1],'pubDate') })).filter(x => x.title && /^https?:\/\//i.test(x.link || '')).sort((a,b)=>(Date.parse(b.published)||0)-(Date.parse(a.published)||0)).slice(0,4);
-    }))).map(r => r.status === 'fulfilled' ? r.value : []);
+    }));
+    const successes=results.filter(r=>r.status==='fulfilled');
+    if(!successes.length)throw Error('all news sources unavailable');
+    const degraded=successes.length!==results.length;
+    if(degraded)logFailure('news','PARTIAL_UPSTREAM_FAILURE');
+    const feeds=results.map(r=>r.status==='fulfilled'?r.value:[]);
     const seen = new Set();
     // Keep local → country → region → global priority, newest first within each group.
     const stories = feeds.flat().filter(story => { const id = story.title.toLowerCase().replace(/[^\p{L}\p{N}]/gu,'').slice(0,120); if(seen.has(id)) return false; seen.add(id); return true; })
       .slice(0,16);
-    const cacheable = json(stories, 200, 'public, max-age=900'); ctx.waitUntil(cache.put(key, cacheable.clone()));
-    return json(stories, 200, fresh ? 'no-store' : 'private, max-age=900');
-  } catch { return json([], 200, 'public, max-age=120'); }
+    const response=json(stories,200,fresh||degraded?'no-store':'private, max-age=900');
+    if(degraded)response.headers.set('x-airly-degraded','1');
+    else ctx.waitUntil(cache.put(key,json(stories,200,'public, max-age=900')));
+    return response;
+  } catch { logFailure('news','UPSTREAM_UNAVAILABLE'); return json({error:'News sources are temporarily unavailable',code:'UPSTREAM_UNAVAILABLE'},503); }
 }
 
 /* ==== Background Web Push ====================================================
@@ -419,29 +348,58 @@ function validPushEndpoint(endpoint) {
   } catch { return null; }
 }
 
+const SUBSCRIPTION_TTL = 30 * 86400;
+const CURSOR_KEY = '_meta:alert-cursor';
+
+async function boundedBody(request, limit=4096) {
+  if(Number(request.headers.get('content-length')||0)>limit)throw Object.assign(Error('Body too large'),{status:413});
+  const reader=request.body?.getReader();if(!reader)return '';
+  const chunks=[];let size=0;
+  try {
+    while(true){const {done,value}=await reader.read();if(done)break;size+=value.byteLength;if(size>limit){await reader.cancel();throw Object.assign(Error('Body too large'),{status:413})}chunks.push(value)}
+  }finally{reader.releaseLock()}
+  const all=new Uint8Array(size);let offset=0;for(const chunk of chunks){all.set(chunk,offset);offset+=chunk.byteLength}
+  return new TextDecoder('utf-8',{fatal:true}).decode(all);
+}
+async function validPushKeys(keys) {
+  try {
+    if(!/^[A-Za-z0-9_-]{87}$/.test(keys?.p256dh||'')||!/^[A-Za-z0-9_-]{22}$/.test(keys?.auth||''))return false;
+    const pub=b64uToBytes(keys.p256dh),auth=b64uToBytes(keys.auth);
+    if(pub.length!==65||pub[0]!==4||auth.length!==16||bytesToB64u(pub)!==keys.p256dh||bytesToB64u(auth)!==keys.auth)return false;
+    await crypto.subtle.importKey('raw',pub,{name:'ECDH',namedCurve:'P-256'},false,[]);return true;
+  }catch{return false}
+}
 async function pushApi(request, env) {
   if (!pushReady(env)) return json({ fallback: true }, 200, 'no-store');
   const url = new URL(request.url);
   if (url.pathname === '/api/push/key' && request.method === 'GET') return json({ key: env.VAPID_PUBLIC_KEY }, 200, 'public, max-age=86400');
   if (request.method !== 'POST') return json({ error: 'method not allowed' }, 405);
+  if(!['/api/push/subscribe','/api/push/unsubscribe'].includes(url.pathname))return json({error:'not found'},404);
   if (request.headers.get('origin') !== url.origin) return json({ error: 'Origin not allowed' }, 403);
-  if (Number(request.headers.get('content-length') || 0) > 4096) return json({ error: 'Body too large' }, 413);
-  let body; try { const raw = await request.text(); if (raw.length > 4096) return json({ error: 'Body too large' }, 413); body = JSON.parse(raw); } catch { return json({ error: 'invalid body' }, 400) }
+  let body;try{body=JSON.parse(await boundedBody(request))}catch(e){return json({error:e.status===413?'Body too large':'invalid body'},e.status||400)}
   const endpoint = validPushEndpoint(body?.endpoint);
   if (!endpoint) return json({ error: 'invalid subscription' }, 400);
   const id = await subKeyOf(endpoint);
-  if (url.pathname === '/api/push/unsubscribe') { await env.PUSH_SUBS.delete(id); return json({ ok: true }); }
-  if (url.pathname === '/api/push/subscribe') {
-    if (typeof body.keys?.p256dh !== 'string' || typeof body.keys?.auth !== 'string') return json({ error: 'invalid subscription' }, 400);
+  try {
+    if (url.pathname === '/api/push/unsubscribe') { await env.PUSH_SUBS.delete(id); return json({ ok: true }); }
+    if(!env.PUSH_LIMIT||!env.PUSH_BUDGET)return json({error:'Registration limits are not configured'},503);
+    const actor=await subKeyOf('airly:'+(request.headers.get('cf-connecting-ip')||'unknown'));
+    const limits=await Promise.all([env.PUSH_LIMIT.limit({key:actor}),env.PUSH_BUDGET.limit({key:'airly:subscribe'})]);
+    if(limits.some(r=>!r.success))return json({error:'Too many registration requests. Try again later.'},429);
+    if (!await validPushKeys(body.keys)) return json({ error: 'invalid subscription keys' }, 400);
     const lat = number(body.lat), lon = number(body.lon), my = typeof body.uid === 'string' && /^my:[A-Z0-9_-]{1,20}$/.test(body.uid), uid = my ? body.uid : number(body.uid);
-    if (lat === null || lon === null || Math.abs(lat)>90 || Math.abs(lon)>180 || (!my && (!Number.isInteger(uid) || uid<=0))) return json({ error: 'Invalid station' }, 400);
-    const rec = { endpoint, keys: { p256dh: body.keys.p256dh.slice(0, 200), auth: body.keys.auth.slice(0, 60) },
-      uid, index: my ? 'my' : 'us', lat, lon, delta: Math.min(100, Math.max(10, Number(body.delta) || 25)),
-      lang: ['en', 'ms', 'ta', 'zh'].includes(body.lang) ? body.lang : 'en', lastAqi: null, ts: Date.now() };
-    await env.PUSH_SUBS.put(id, JSON.stringify(rec));
+    if (lat === null || lon === null || Math.abs(lat)>90 || Math.abs(lon)>180 || (!my && (!Number.isSafeInteger(uid) || uid<=0 || uid>999999999))) return json({ error: 'Invalid station' }, 400);
+    const old=JSON.parse(await env.PUSH_SUBS.get(id)||'null');
+    const method=my?'doe-official-api':WAQI_METHOD;
+    const same=old?.uid===uid&&old?.index===(my?'my':'us')&&old?.calculation===method;
+    const rec = { endpoint, keys:{p256dh:body.keys.p256dh,auth:body.keys.auth}, uid, index: my ? 'my' : 'us', calculation:method, lat, lon,
+      delta: Math.min(100, Math.max(10, Number(body.delta) || 25)),
+      lang: ['en', 'ms', 'ta', 'zh'].includes(body.lang) ? body.lang : 'en',
+      lastAqi:same?old.lastAqi:null,lastTime:same?old.lastTime:null,lastSeen:same?old.lastSeen:null,
+      ts:Date.now(),expiresAt:Date.now()+SUBSCRIPTION_TTL*1000 };
+    await env.PUSH_SUBS.put(id, JSON.stringify(rec),{expirationTtl:SUBSCRIPTION_TTL});
     return json({ ok: true });
-  }
-  return json({ error: 'not found' }, 404);
+  }catch{logFailure('push','STORAGE_UNAVAILABLE');return json({error:'Subscription storage is unavailable'},503)}
 }
 
 const PUSH_I18N = {
@@ -453,475 +411,61 @@ const PUSH_I18N = {
 
 async function checkSubscriptions(env) {
   if (!pushReady(env)) return;
-  const list = await env.PUSH_SUBS.list({ limit: 1000 });
-  const feedMemo = new Map(); // one request per station, one DOE snapshot per run
-  for (const k of list.keys) {
+  const started=Date.now(),feedMemo=new Map();let processed=0,pages=0;
+  const memo=(key,fn)=>{if(!feedMemo.has(key))feedMemo.set(key,Promise.resolve().then(fn));return feedMemo.get(key)};
+  let state;
+  try{state=JSON.parse(await env.PUSH_SUBS.get(CURSOR_KEY)||'null')||{cursor:undefined,offset:0}}
+  catch{logFailure('push-cron','CURSOR_UNAVAILABLE');return}
+  const process=async k=>{
+    if(k.name===CURSOR_KEY)return;
     try {
-      const rec = JSON.parse(await env.PUSH_SUBS.get(k.name) || 'null'); if (!rec?.endpoint) continue;
-      if (!validPushEndpoint(rec.endpoint)) continue;
-      const my = typeof rec.uid === 'string' && /^my:[A-Z0-9_-]{1,20}$/.test(rec.uid);
-      if (!my && !env.AQICN_TOKEN) continue;
-      const bucket = my ? rec.uid : Number.isInteger(rec.uid) && rec.uid > 0 ? '@'+rec.uid : 'geo:'+Number(rec.lat)+';'+Number(rec.lon);
-      if (!feedMemo.has(bucket)) {
-        if (my) {
-          if (!feedMemo.has('doe')) feedMemo.set('doe', await malaysiaStations().catch(()=>[]));
-          const d = feedMemo.get('doe').find(s=>s.uid===rec.uid);
-          feedMemo.set(bucket, d ? {status:'ok',data:{aqi:d.aqi,city:{name:d.name},time:{iso:d.time}}} : null);
-        } else feedMemo.set(bucket, await fetchJson(`https://api.waqi.info/feed/${bucket}/?token=${encodeURIComponent(env.AQICN_TOKEN)}`).catch(() => null));
+      const rec=JSON.parse(await env.PUSH_SUBS.get(k.name)||'null');if(!rec?.endpoint)return;
+      if(!validPushEndpoint(rec.endpoint)||!await validPushKeys(rec.keys)||!Number.isFinite(rec.expiresAt)&&(!Number.isFinite(rec.ts)||Date.now()-rec.ts>SUBSCRIPTION_TTL*1000)||Number.isFinite(rec.expiresAt)&&rec.expiresAt<Date.now()){await env.PUSH_SUBS.delete(k.name);return}
+      const my=typeof rec.uid==='string'&&/^my:[A-Z0-9_-]{1,20}$/.test(rec.uid);
+      if(!my&&!env.AQICN_TOKEN)return;
+      const bucket=my?rec.uid:'@'+rec.uid;
+      const feed=await memo(bucket,async()=>{
+        if(my){const stations=await memo('doe',malaysiaStations),d=stations.find(s=>s.uid===rec.uid);return d?{status:'ok',data:{aqi:d.aqi,city:{name:d.name},time:{iso:d.time}}}:null}
+        return fetchJson('https://api.waqi.info/feed/'+bucket+'/?token='+encodeURIComponent(env.AQICN_TOKEN));
+      });
+      if(feed?.status!=='ok')return;
+      const method=my?'doe-official-api':WAQI_METHOD;
+      const aqi=my?validAqi(feed.data?.aqi):normalizeWaqi(feed.data,rec.uid).aqi,stamp=Date.parse(measurementTime(feed.data?.time)||'');
+      if(aqi===null||!Number.isFinite(stamp))return;
+      if(rec.calculation!==method){rec.lastAqi=null;rec.lastTime=null;rec.lastSeen=null;rec.calculation=method}
+      const next=alertTransition({aqi:rec.lastAqi,time:rec.lastTime,seen:rec.lastSeen??rec.lastTime},aqi,stamp,rec.delta);
+      if(!next)return;
+      rec.lastSeen=next.seen;
+      if(next.notify){
+        const dir=aqi>rec.lastAqi?1:-1;
+        const [title,msg]=(PUSH_I18N[rec.lang]||PUSH_I18N.en)(feed.data.city?.name||'Your area',Math.abs(aqi-rec.lastAqi),dir,aqi);
+        const response=await sendPush(env,rec,JSON.stringify({title,body:msg.replace('AQI',my?'Malaysia API':'US AQI (WAQI)')}));
+        if(response.status===404||response.status===410){await env.PUSH_SUBS.delete(k.name);return}
+        if(response.ok){rec.lastAqi=next.aqi;rec.lastTime=next.time}else logFailure('push-cron','DELIVERY_REJECTED');
+      }else{rec.lastAqi=next.aqi;rec.lastTime=next.time}
+      // Legacy records acquire a finite expiry; processing never renews consent.
+      rec.expiresAt??=rec.ts+SUBSCRIPTION_TTL*1000;
+      await env.PUSH_SUBS.put(k.name,JSON.stringify(rec),{expirationTtl:Math.max(60,Math.ceil((rec.expiresAt-Date.now())/1000))});
+    }catch{logFailure('push-cron','SUBSCRIBER_CHECK_FAILED')}
+  };
+  try {
+    while(pages++<32){
+      const list=await env.PUSH_SUBS.list({limit:64,...(state.cursor?{cursor:state.cursor}:{})});
+      for(let offset=state.offset||0;offset<list.keys.length;offset+=4){
+        if(Date.now()-started>180000){state.offset=offset;await env.PUSH_SUBS.put(CURSOR_KEY,JSON.stringify(state));return}
+        const batch=list.keys.slice(offset,offset+4);await Promise.all(batch.map(process));processed+=batch.length;
       }
-      const feed = feedMemo.get(bucket); if (!feed) continue;
-      const aqi = validAqi(feed?.data?.aqi), stamp = Date.parse(feed?.data?.time?.iso || '');
-      if (feed?.status !== 'ok' || aqi === null || !Number.isFinite(stamp) || Date.now()-stamp>10800000 || stamp>Date.now()+600000) continue;
-      if (Number.isFinite(rec.lastTime) && stamp<=rec.lastTime) continue;
-      if (Number.isFinite(rec.lastTime) && Date.now()-rec.lastTime>10800000) rec.lastAqi=null;
-      if (Number.isFinite(rec.lastAqi) && Math.abs(aqi - rec.lastAqi) >= rec.delta) {
-        const dir = aqi > rec.lastAqi ? 1 : -1;
-        const [title, msg] = (PUSH_I18N[rec.lang] || PUSH_I18N.en)(feed.data.city?.name || 'Your area', Math.abs(aqi - rec.lastAqi), dir, aqi);
-        const res = await sendPush(env, rec, JSON.stringify({ title, body: msg.replace('AQI',my?'Malaysia API':'US AQI') }));
-        if (res.status === 404 || res.status === 410) { await env.PUSH_SUBS.delete(k.name); continue; }
-        if (res.ok) { rec.lastAqi = aqi; rec.lastTime = stamp; await env.PUSH_SUBS.put(k.name, JSON.stringify(rec)); }
-      } else if (!Number.isFinite(rec.lastAqi)) { rec.lastAqi = aqi; rec.lastTime = stamp; await env.PUSH_SUBS.put(k.name, JSON.stringify(rec)); }
-    } catch { /* continue with next subscriber */ }
-  }
+      if(list.list_complete){await env.PUSH_SUBS.delete(CURSOR_KEY);break}
+      if(!list.cursor)throw Error('incomplete listing without cursor');
+      state={cursor:list.cursor,offset:0};await env.PUSH_SUBS.put(CURSOR_KEY,JSON.stringify(state));
+    }
+    console.log(JSON.stringify({event:'push_check',processed,pages,durationMs:Date.now()-started}));
+  }catch{logFailure('push-cron','LIST_FAILED');await env.PUSH_SUBS.delete(CURSOR_KEY)}
 }
 
-function HTML_SOURCE(){/*<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#fffefa"><title>Airly by Ordinexis — Air quality near you</title><link rel="stylesheet" href="/vendor/leaflet.css">
-<style>
-:root{--ink:#16382d;--muted:#56665f;--paper:#fffefa;--base:#f4f5f0;--line:#dce4dd;--green:#27694f;--soft:#e8f1ea;--header:114px;--nav:68px;color-scheme:light}
-*{box-sizing:border-box}html,body{margin:0;height:100%;overflow:hidden}body{font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;color:var(--ink);background:var(--paper);-webkit-text-size-adjust:100%}
-button,input,select{font:inherit}button,a,input,select{-webkit-tap-highlight-color:transparent}button{cursor:pointer;touch-action:manipulation}button:disabled{cursor:default;opacity:.55}button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible{outline:3px solid #257bc2;outline-offset:3px}button{color:inherit}a{color:var(--green);text-underline-offset:3px}button svg{width:21px;height:21px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}.hidden,[hidden]{display:none!important}
-.app{height:100vh;height:100dvh;display:grid;grid-template-rows:auto minmax(0,1fr);overflow:hidden}.top{background:var(--paper);border-bottom:1px solid var(--line);padding:12px max(20px,env(safe-area-inset-right)) 10px max(20px,env(safe-area-inset-left));display:grid;grid-template-columns:1fr auto;gap:10px 16px;z-index:20}.brand{text-decoration:none;color:var(--ink);display:flex;align-items:center;gap:7px;font-size:23px;font-weight:750;letter-spacing:-.7px}.brand img{width:24px;height:24px}.brand small{font-weight:450;font-size:11px;letter-spacing:0;color:var(--muted);align-self:center}.actions{display:flex;align-items:center;gap:5px}.icon-button,.round{height:44px;min-width:44px;border:1px solid var(--line);border-radius:8px;background:transparent;display:inline-flex;align-items:center;justify-content:center;padding:9px}.actions select{max-width:86px;padding:0 6px;font-size:14px}.locationbar{grid-column:1/-1;display:flex;gap:8px;align-items:center;min-width:0}.locationbar .place{background:transparent;border:0;min-width:0;min-height:36px;padding:0;display:flex;gap:7px;align-items:center;font-size:13px}.place span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.locationbar .refresh{margin-left:auto;min-width:36px;height:36px;border:0;padding:5px}.connection{color:var(--muted);font-size:11px;white-space:nowrap}.workspace{min-height:0;display:grid;grid-template-columns:minmax(0,1fr) 420px;position:relative}.map-wrap{position:relative;min-width:0;min-height:0;background:#e8eee7;isolation:isolate}.map{position:absolute;inset:0;z-index:1}.map-controls{position:absolute;top:14px;left:14px;z-index:800;display:flex;gap:6px}.map-controls button{background:var(--paper);border:1px solid #ccd5ce}.map-hint{position:absolute;z-index:800;bottom:36px;left:14px;right:14px;pointer-events:none;font-size:12px}.map-hint span{background:var(--paper);padding:5px 9px;display:inline-block;border:1px solid var(--line);border-radius:5px}.map-status{background:var(--paper);padding:20px;color:var(--muted)}.card{min-width:0;min-height:0;overflow:auto;border-left:1px solid var(--line);padding:20px 24px 16px;scrollbar-width:thin;overscroll-behavior:contain;background:var(--paper)}.tabs{display:flex;gap:2px;padding:4px 16px;position:absolute;top:0;right:0;width:420px;background:var(--paper);border-bottom:1px solid var(--line);z-index:10}.tabs button{flex:1;min-width:0;min-height:48px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;padding:6px 2px;border:0;border-radius:6px;background:transparent;font-size:11px;color:var(--muted)}.tabs button svg{display:none}.tabs button[aria-selected=true]{background:var(--soft);color:var(--ink);font-weight:700}.tabs [data-tab=map]{display:none}.card{padding-top:78px}.live{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--muted);margin:0 0 16px}.status-dot{width:7px;height:7px;border-radius:100%;background:#6a7c70;flex-shrink:0}.live[data-quality=fresh] .status-dot{background:#327657}.live[data-quality=stale] .status-dot{background:#b77916}.eyebrow{font-size:11px;font-weight:650;text-transform:uppercase;letter-spacing:.09em;color:var(--muted);margin:0 0 5px}.station-name{font-size:19px;line-height:1.35;font-weight:650;letter-spacing:-.35px;margin:0;overflow-wrap:anywhere}.distance{font-size:12px;color:var(--muted);margin:6px 0 14px}.score{display:flex;gap:18px;align-items:center;margin:12px 0 18px}.score strong{font-size:82px;letter-spacing:-5px;line-height:1;font-weight:650;font-variant-numeric:tabular-nums}.score span{font-size:12px;color:var(--muted)}.score b{display:block;font-size:19px;line-height:1.25;max-width:190px;color:var(--ink);font-weight:650;margin-bottom:5px}.aqi-scale{display:grid;grid-template-columns:repeat(6,1fr);gap:3px;margin:0 0 22px}.aqi-scale i{height:5px;border-radius:2px;opacity:.3}.aqi-scale i.active{opacity:1;transform:scaleY(1.8)}.advice{border-left:3px solid var(--green);padding:2px 0 2px 14px;margin:0 0 20px}.advice h2{font-size:15px;margin:0 0 5px}.advice p{font-size:14px;line-height:1.55;margin:0;color:#3f5148}.metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;padding:18px 0;margin:0;border-block:1px solid var(--line)}.metric span,.metric small{display:block;font-size:11px;color:var(--muted)}.metric b{display:block;font-size:23px;font-weight:600;margin:3px 0;letter-spacing:-.5px;font-variant-numeric:tabular-nums}.reading-details{margin:16px 0;font-size:12px;color:var(--muted)}.reading-details summary{cursor:pointer;min-height:32px;display:flex;align-items:center;gap:6px;color:var(--ink);font-weight:600}.reading-details summary:after{content:'+';margin-left:auto}.reading-details[open] summary:after{content:'−'}.reading-details p{margin:8px 0;line-height:1.6}.reading-details a{display:inline}.pollutants{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;font-size:12px;margin:8px 0}.pollutants span{padding:7px;background:var(--base);border-radius:4px}.alert{display:flex;align-items:center;gap:12px;width:100%;padding:12px 14px;min-height:48px;text-align:left;border:1px solid var(--line);border-radius:8px;background:var(--base);margin:18px 0}.alert span{flex:1}.alert b{font-size:13px;display:block}.alert small{display:block;font-size:11px;color:var(--muted);margin-top:2px}.credit{border-top:1px solid var(--line);padding-top:16px;margin-top:24px;font-size:11px;line-height:1.65;color:var(--muted)}.credit p{margin:3px 0}.credit .credits{display:flex;gap:4px 10px;flex-wrap:wrap}.credits span{white-space:nowrap}.panel h2{font-size:23px;letter-spacing:-.5px;font-weight:650;margin:0 0 6px}.panel>p{margin:0 0 18px;font-size:13px;color:var(--muted)}.row{width:100%;display:flex;align-items:center;gap:12px;border:0;border-bottom:1px solid var(--line);background:transparent;padding:14px 0;text-align:left;min-height:64px}.row:hover{background:var(--base)}.row .row-text{flex:1;min-width:0}.row b{display:block;font-size:14px;font-weight:600;overflow-wrap:anywhere}.row small{display:block;color:var(--muted);font-size:12px;margin-top:3px}.badge{min-width:42px;height:38px;display:grid;place-items:center;border-radius:6px;color:white;font-size:13px;font-weight:700;flex-shrink:0}.story{display:block;text-decoration:none;padding:15px 0;border-bottom:1px solid var(--line);color:var(--ink)}.story b{display:block;font-size:15px;line-height:1.45;font-weight:600;margin:5px 0}.story small,.story span{display:block;font-size:11px;color:var(--muted)}.panelhead{display:flex;justify-content:space-between;align-items:start;gap:10px}.notice{padding:12px 14px;border:1px solid #e1d4aa;border-radius:6px;background:#fff9e9;color:#6b522a;font-size:12px;margin:12px 0}.empty{padding:28px 0;min-height:210px}.empty h1{font-size:25px;letter-spacing:-.5px;line-height:1.25;margin:10px 0}.empty p{font-size:14px;color:var(--muted)}.primary{background:var(--ink);color:white;min-height:46px;border:0;border-radius:7px;padding:10px 16px}.skeleton{height:14px;border-radius:3px;background:#e5ebe4;margin:14px 0;animation:breathe 1.5s ease-in-out infinite alternate}.skeleton.score-load{height:78px;width:55%;margin:26px 0}.overlay{position:fixed;inset:0;background:#10261c65;display:flex;justify-content:center;align-items:center;padding:16px;z-index:200}.modal{background:var(--paper);padding:28px;width:min(460px,100%);max-height:calc(100dvh - 32px);overflow:auto;overscroll-behavior:contain;border:1px solid var(--line);border-radius:12px;position:relative}.modal h2{font-size:23px;letter-spacing:-.5px;margin:0 40px 8px 0}.modal>p{font-size:13px;color:var(--muted)}.close{position:absolute;right:10px;top:10px;height:44px;width:44px;border:0;background:transparent;font-size:26px}.field{display:block;margin:20px 0;font-size:14px}.field input[type=range]{width:100%;height:44px;accent-color:var(--green)}.setting{display:flex;align-items:center;justify-content:space-between;gap:18px;padding:15px 0;border-top:1px solid var(--line)}.setting b{font-size:14px}.setting small{display:block;color:var(--muted);font-size:12px;margin-top:4px}.setting input{width:24px;height:24px;accent-color:var(--green);flex-shrink:0}.field select,.sinput{width:100%;min-height:48px;border:1px solid var(--line);border-radius:6px;padding:10px;background:var(--paper);color:var(--ink);font-size:16px}.save{width:100%;margin-top:12px}.toast{position:fixed;z-index:300;bottom:22px;left:50%;transform:translateX(-50%);width:max-content;max-width:calc(100vw - 32px);padding:12px 16px;font-size:13px;border-radius:8px;background:var(--ink);color:#fff;box-shadow:0 4px 18px #10251c20;pointer-events:none}.leaflet-container{font-family:inherit;background:#e6eee7}.leaflet-control-attribution{font-size:10px!important}.leaflet-control-zoom{box-shadow:none!important;border:1px solid var(--line)!important}.leaflet-control-zoom a{width:40px!important;height:40px!important;line-height:40px!important}.map-bubble{height:34px;min-width:38px;padding:0 5px;display:grid;place-items:center;background:var(--aqi);border:2px solid #fff;border-radius:8px;color:#fff;font-size:12px;font-weight:750;font-variant-numeric:tabular-nums;box-shadow:0 1px 4px #17261e30}.map-bubble{position:relative}.map-bubble:after{content:'';position:absolute;bottom:-6px;left:14px;border:4px solid transparent;border-top-color:var(--aqi);border-bottom:0}.mobile-map-card>span:last-child{flex:none;width:24px}.map-bubble.active{outline:3px solid #173c30;outline-offset:2px}.user-dot{width:16px;height:16px;background:#257bc2;border:3px solid white;border-radius:100%;box-shadow:0 0 0 6px #257bc230}.forecast-row{display:grid;grid-template-columns:1fr 1fr auto;gap:10px;padding:12px 0;border-bottom:1px solid var(--line);font-size:13px}.forecast-row span{color:var(--muted)}.mobile-map-card{display:none}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap}.spin{animation:rotate 1s linear infinite}.chart{width:100%;height:auto}.chart text{font-family:inherit}.lang-ta .tabs button{font-size:10px}
-@keyframes rotate{to{transform:rotate(360deg)}}@keyframes breathe{to{opacity:.5}}
-@media(min-width:1100px){.top{grid-template-columns:1fr auto 1fr;align-items:center;gap:18px;padding-top:12px;padding-bottom:12px}.actions{grid-column:3;grid-row:1;justify-self:end}.locationbar{grid-column:2;grid-row:1;min-width:280px}}
-@media(max-width:820px){.workspace{display:block;min-height:0;overflow:hidden}.top{padding:7px max(12px,env(safe-area-inset-right)) 4px max(12px,env(safe-area-inset-left));gap:3px 8px}.brand{font-size:21px;gap:5px;letter-spacing:-.6px}.brand small{font-size:10px;display:block;max-width:58px;line-height:1.15}.actions{gap:2px}.actions .icon-button{border:0}.actions select{width:64px;font-size:13px;border:0}.locationbar .place{font-size:12px}.locationbar{gap:4px}.connection{font-size:10px}.card{border:0;position:absolute;inset:0 0 calc(var(--nav) + env(safe-area-inset-bottom));padding:22px max(20px,env(safe-area-inset-right)) 20px max(20px,env(safe-area-inset-left));}.tabs{position:absolute;top:auto;bottom:0;left:0;right:0;width:100%;height:calc(var(--nav) + env(safe-area-inset-bottom));padding:4px max(6px,env(safe-area-inset-right)) calc(4px + env(safe-area-inset-bottom)) max(6px,env(safe-area-inset-left));border:0;border-top:1px solid var(--line);gap:0}.tabs button{font-size:11px;min-height:56px;border-radius:6px;gap:4px}.tabs button svg{display:block;width:20px;height:20px}.tabs [data-tab=map]{display:flex}.tabs button[aria-selected=true]{background:transparent;color:var(--green)}.tabs button[aria-selected=true] svg{stroke-width:2.4}.map-wrap{position:absolute;inset:0 0 calc(var(--nav) + env(safe-area-inset-bottom));visibility:hidden;pointer-events:none}.app[data-view=map] .map-wrap{visibility:visible;pointer-events:auto}.app[data-view=map] .card{display:none}.score strong{font-size:88px}.score{margin-top:18px}.station-name{font-size:22px}.live{margin-bottom:20px}.credit{margin-top:22px}.map-hint{bottom:107px}.mobile-map-card{position:absolute;z-index:800;left:14px;right:14px;bottom:32px;min-height:58px;padding:10px 14px;display:flex;align-items:center;gap:12px;border:1px solid var(--line);background:var(--paper);border-radius:8px;text-align:left}.mobile-map-card>span{min-width:0;flex:1}.mobile-map-card b{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}.mobile-map-card small{font-size:11px;color:var(--muted)}.mobile-map-card strong{font-size:25px}.overlay{align-items:flex-end;padding:0}.modal{max-height:calc(100dvh - 20px);width:100%;border-radius:16px 16px 0 0;padding:26px 22px calc(22px + env(safe-area-inset-bottom));border:0}.toast{bottom:calc(80px + env(safe-area-inset-bottom))}.leaflet-control-zoom{margin-bottom:116px!important}}
-@media(max-width:360px){.brand small{display:none}.card{padding-left:16px;padding-right:16px}.connection{max-width:88px;overflow:hidden;text-overflow:ellipsis}.tabs button{font-size:10px}.score strong{font-size:78px}.score b{font-size:17px}}
-.map-hint{left:64px}
-@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;scroll-behavior:auto!important;transition:none!important}}
-
-</style>
-</head><body><main class="app" data-view="now">
-<header class="top">
-<a class="brand" href="/" aria-label="Airly by Ordinexis"><img src="/favicon.png" alt="" width="24" height="24">Airly <small>by Ordinexis</small></a>
-<div class="actions"><button class="icon-button" id="open-search" aria-label="Search for a city" data-icon="search"></button><select class="round" id="lang" aria-label="Language"><option value="en">EN</option><option value="ms">BM</option><option value="ta">தமிழ்</option><option value="zh">中文</option></select><button class="icon-button" id="open-settings" aria-label="Settings" data-icon="settings"></button></div>
-<div class="locationbar"><button class="place" id="location" aria-label="Use my location"><span data-icon="location"></span><span id="place">Finding your area…</span></button><span id="connection" class="connection" role="status">Connecting</span><button class="icon-button refresh" id="refresh" aria-label="Refresh current station" data-icon="refresh"></button></div>
-</header>
-<div class="workspace">
-<section class="map-wrap" aria-label="Air quality map"><div id="map" class="map"><p class="map-status">Loading map…</p></div><div class="map-controls"><button id="locate" class="icon-button" aria-label="Centre map on my location" data-icon="location"></button></div><div class="map-hint"><span id="map-hint">US AQI · tap a station</span></div><button class="mobile-map-card" id="map-reading"><span><b id="map-station">Select a station</b><small id="map-reading-label">View air quality</small></span><strong id="map-aqi">—</strong><span data-icon="arrow"></span></button></section>
-<aside class="card" id="card" aria-label="Air quality dashboard">
-<section id="now" role="tabpanel" aria-labelledby="tab-now"></section>
-<section id="nearby" role="tabpanel" aria-labelledby="tab-nearby" hidden></section>
-<section id="news" role="tabpanel" aria-labelledby="tab-news" hidden></section>
-<section id="trend" role="tabpanel" aria-labelledby="tab-trend" hidden></section>
-<footer class="credit"><p>Airly by <a href="https://www.ordinexis.com" target="_blank" rel="noopener noreferrer">Ordinexis</a> · <a href="https://github.com/sanjayws/airly" target="_blank" rel="noopener noreferrer">GitHub</a></p><p data-i18n="privacyNote">Preferences stay on this device.</p><div class="credits"><span>Map: © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">OpenStreetMap</a></span><span>Data: <a id="data-source" href="https://waqi.info" target="_blank" rel="noopener noreferrer">World Air Quality Index Project</a></span></div></footer>
-</aside>
-<nav class="tabs" role="tablist" aria-label="Views">
-<button id="tab-now" role="tab" data-tab="now" aria-controls="now" aria-selected="true"><span data-icon="air"></span><span data-i18n="now">Air Quality</span></button>
-<button id="tab-map" role="tab" data-tab="map" aria-controls="map" aria-selected="false"><span data-icon="map"></span><span data-i18n="mapTab">Map</span></button>
-<button id="tab-nearby" role="tab" data-tab="nearby" aria-controls="nearby" aria-selected="false"><span data-icon="location"></span><span data-i18n="nearby">Nearby</span></button>
-<button id="tab-news" role="tab" data-tab="news" aria-controls="news" aria-selected="false"><span data-icon="news"></span><span data-i18n="news">News</span></button>
-<button id="tab-trend" role="tab" data-tab="trend" aria-controls="trend" aria-selected="false"><span data-icon="chart"></span><span data-i18n="forecastTab">Forecast</span></button>
-</nav>
-</div>
-<div id="modal" class="overlay" hidden><section class="modal" role="dialog" aria-modal="true" aria-labelledby="settings-title"><button class="close" id="close" aria-label="Close settings">×</button><h2 id="settings-title" data-i18n="settingsBtn">Settings</h2><p data-i18n="settingsNote">Preferences are saved on this device.</p>
-<label class="field"><span data-i18n="indexL">Air quality index</span><select id="index"><option value="auto" data-i18n="indexAuto">Automatic · Malaysia API in Malaysia</option><option value="my" data-i18n="indexMY">Malaysia API · official DOE stations</option><option value="us" data-i18n="indexUS">US AQI · worldwide stations</option></select></label>
-<label class="field"><span data-i18n="deltaL">Notify when AQI changes by</span> <b id="delta-label">25+</b><input id="delta" type="range" min="10" max="100" step="5" value="25"></label>
-<label class="setting"><span><b data-i18n="notifT">Browser notifications</b><small id="notify-help" data-i18n="foregroundNote">Check for changes while this app is open.</small></span><input id="browser-alert" type="checkbox"></label>
-<label class="setting" id="background-setting" hidden><span><b data-i18n="backgroundTitle">Background alerts</b><small data-i18n="backgroundNote">Opt in to store this station and your push subscription on the server for scheduled checks. Turn off to delete the subscription.</small></span><input id="background-alert" type="checkbox"></label>
-<label class="setting"><span><b data-i18n="sensT">Sensitive health profile</b><small data-i18n="sensS">Stricter personal guidance</small></span><input id="sensitive" type="checkbox"></label>
-<label class="field"><span data-i18n="localeL">Local news</span><select id="locale"><option value="AUTO">Automatic</option value="MY">Malaysia</option><option value="SG">Singapore</option><option value="ID">Indonesia</option><option value="TH">Thailand</option><option value="VN">Vietnam</option><option value="PH">Philippines</option><option value="BN">Brunei</option><option value="KH">Cambodia</option><option value="LA">Laos</option><option value="MM">Myanmar</option><option value="TL">Timor-Leste</option></select></label><button class="save primary" id="save" data-i18n="save">Save preferences</button></section></div>
-<div id="smodal" class="overlay" hidden><section class="modal" role="dialog" aria-modal="true" aria-labelledby="search-title"><button class="close" id="sclose" aria-label="Close search">×</button><h2 id="search-title" data-i18n="searchT">Find a city</h2><label class="sr-only" for="sinput">City name</label><input id="sinput" class="sinput" type="search" autocomplete="off" enterkeyhint="search" placeholder="City name…"><div id="sresults" aria-live="polite"></div></section></div>
-<div id="toast" class="toast" role="status" hidden></div>
-</main>
-<script src="/vendor/leaflet.js"></script><script>
-const I18N={
-en:{settingsBtn:'Settings',now:'Air Quality',nearby:'Nearby',news:'News',sample:'SAMPLE DATA',live:'LIVE READING',monitor:'NEAREST MONITOR',usaqi:'US AQI',fromyou:'km from you',reading:'current reading',humidity:'Humidity',wind:'Wind',lvl0:'Good',lvl1:'Moderate',lvl2:'Sensitive',lvl3:'Unhealthy',lvl4:'Very unhealthy',lvl5:'Hazardous',adv0T:'Good time to be outside',adv0B:'Enjoy your usual activities.',adv1T:'Generally acceptable',adv1B:'Unusually sensitive people may reduce prolonged exertion.',adv1Bs:'Watch for symptoms during long outdoor activity.',adv2T:'Reduce prolonged activity',adv2B:'Sensitive groups should limit prolonged outdoor exertion.',adv2Bs:'Keep activity light and consider a well-fitted mask.',adv3T:'Limit time outdoors',adv3B:'Everyone should reduce intense outdoor activity.',adv4T:'Stay indoors if possible',adv4B:'Close windows, use filtration, and avoid outdoor exertion.',alertT:'Alert me to meaningful changes',alertS:'Alerts on meaningful AQI changes — even when Airly is closed.',nearbyT:'Monitoring stations near you',nearbyS:'Tap a station to make it your dashboard.',newsT:'What’s shaping the air',newsS:'Recent haze and air-quality coverage for your locale.',nonews:'No recent coverage found.',settingsT:'Alerts that matter',settingsP:'Preferences stay on this device. Alerts can arrive even when Airly is closed.',deltaL:'Notify when AQI changes by',notifT:'Browser notifications',notifS:'Alert me to meaningful AQI changes',sensT:'Sensitive health profile',sensS:'Stricter personal guidance',localeL:'Local news',save:'Save preferences',saved:'Preferences saved on this device.',locA:'Using approximate IP location',locB:'Location unavailable — using Kuala Lumpur.',errA:'Live token is not configured — showing sample readings.',errB:'Live data temporarily unavailable — retrying soon.',noNotif:'Notifications are not supported in this browser.',aiStamp:'The above advisory is generated by AI — check critical information',updated:'Station updated',myapi:'API (MY) approx.',trend:'Trend & Forecast',trendT:'PM2.5 outlook',trendS:'Daily forecast range and average',trendNone:'No forecast available for this station yet.',trendSrc:'Forecast by the World Air Quality Index Project.',reset:'Reset',hsHint:'On iPhone/iPad: Share → Add to Home Screen, then open Airly from that icon to enable alerts.',searchT:'Find a city',searchPh:'City or station name…',noResults:'No stations found.',locBlocked:'Location is blocked. Allow it in the browser\'s site settings — and on iPhone also Settings → your browser app → Location.',yourloc:'My Location (zoom in)',approx:'Approx. '},
-ms:{settingsBtn:'Tetapan',now:'Kualiti Udara',nearby:'Berdekatan',news:'Berita',sample:'DATA CONTOH',live:'BACAAN LANGSUNG',monitor:'STESEN TERDEKAT',usaqi:'AQI AS',fromyou:'km dari anda',reading:'bacaan semasa',humidity:'Kelembapan',wind:'Angin',lvl0:'Baik',lvl1:'Sederhana',lvl2:'Sensitif',lvl3:'Tidak sihat',lvl4:'Sangat tidak sihat',lvl5:'Berbahaya',adv0T:'Sesuai untuk aktiviti luar',adv0B:'Nikmati aktiviti seperti biasa.',adv1T:'Umumnya boleh diterima',adv1B:'Individu yang sangat sensitif boleh kurangkan aktiviti berpanjangan.',adv1Bs:'Perhatikan simptom semasa aktiviti luar yang lama.',adv2T:'Kurangkan aktiviti berpanjangan',adv2B:'Kumpulan sensitif harus hadkan aktiviti luar yang lama.',adv2Bs:'Kekalkan aktiviti ringan dan pertimbangkan pelitup muka.',adv3T:'Hadkan masa di luar',adv3B:'Semua orang harus kurangkan aktiviti luar yang berat.',adv4T:'Kekal di dalam jika boleh',adv4B:'Tutup tingkap, guna penapis udara dan elakkan aktiviti luar.',alertT:'Maklumkan perubahan penting',alertS:'Amaran perubahan AQI ketara — walaupun Airly ditutup.',nearbyT:'Stesen pemantauan berdekatan',nearbyS:'Ketik stesen untuk jadikan papan pemuka anda.',newsT:'Apa yang mempengaruhi udara',newsS:'Liputan jerebu dan kualiti udara terkini untuk lokasi anda.',nonews:'Tiada liputan terkini.',settingsT:'Amaran yang penting',settingsP:'Tetapan disimpan pada peranti ini. Notifikasi boleh tiba walaupun Airly ditutup.',deltaL:'Maklumkan apabila AQI berubah sebanyak',notifT:'Notifikasi pelayar',notifS:'Maklumkan perubahan AQI yang ketara',sensT:'Profil kesihatan sensitif',sensS:'Panduan peribadi lebih ketat',localeL:'Berita tempatan',save:'Simpan tetapan',saved:'Tetapan disimpan pada peranti ini.',locA:'Menggunakan lokasi IP anggaran',locB:'Lokasi tidak tersedia — menggunakan Kuala Lumpur.',errA:'Token langsung belum dikonfigurasi — memaparkan data contoh.',errB:'Data langsung tidak tersedia buat masa ini.',noNotif:'Notifikasi tidak disokong dalam pelayar ini.',aiStamp:'Nasihat di atas dijana oleh AI — semak maklumat penting',updated:'Stesen dikemas kini',myapi:'API (MY) anggaran',trend:'Tren & Ramalan',trendT:'Unjuran PM2.5',trendS:'Julat dan purata ramalan harian',trendNone:'Tiada ramalan untuk stesen ini lagi.',trendSrc:'Ramalan oleh World Air Quality Index Project.',reset:'Set Semula',hsHint:'Di iPhone/iPad: Kongsi → Tambah ke Skrin Utama, kemudian buka Airly dari ikon itu untuk amaran.',searchT:'Cari bandar',searchPh:'Nama bandar atau stesen…',noResults:'Tiada stesen dijumpai.',locBlocked:'Lokasi disekat. Benarkan dalam tetapan laman pelayar — di iPhone, juga Tetapan → aplikasi pelayar → Lokasi.',yourloc:'Lokasi Saya (zum)',approx:'Anggaran '},
-ta:{settingsBtn:'அமைப்பு',now:'காற்றுத் தரம்',nearby:'அருகில்',news:'செய்திகள்',sample:'மாதிரி தரவு',live:'நேரடி அளவீடு',monitor:'அருகிலுள்ள நிலையம்',usaqi:'US AQI',fromyou:'கி.மீ தொலைவில்',reading:'தற்போதைய அளவீடு',humidity:'ஈரப்பதம்',wind:'காற்று',lvl0:'நல்லது',lvl1:'மிதமானது',lvl2:'உணர்திறனுக்கு தீங்கு',lvl3:'ஆரோக்கியமற்றது',lvl4:'மிகவும் ஆரோக்கியமற்றது',lvl5:'அபாயகரமானது',adv0T:'வெளியே செல்ல நல்ல நேரம்',adv0B:'வழக்கமான செயல்பாடுகளைத் தொடரலாம்.',adv1T:'பொதுவாக ஏற்கத்தக்கது',adv1B:'மிக உணர்திறன் உள்ளவர்கள் நீண்ட உழைப்பைக் குறைக்கலாம்.',adv1Bs:'நீண்ட வெளிப்புற செயல்பாட்டின்போது அறிகுறிகளைக் கவனியுங்கள்.',adv2T:'நீண்ட செயல்பாட்டைக் குறைக்கவும்',adv2B:'உணர்திறன் குழுக்கள் நீண்ட வெளிப்புற உழைப்பைக் கட்டுப்படுத்த வேண்டும்.',adv2Bs:'இலகுவான செயல்பாடு; பொருத்தமான முகக்கவசம் பரிசீலிக்கவும்.',adv3T:'வெளியே இருக்கும் நேரத்தைக் குறைக்கவும்',adv3B:'அனைவரும் கடும் வெளிப்புற செயல்பாட்டைக் குறைக்க வேண்டும்.',adv4T:'முடிந்தால் உள்ளேயே இருங்கள்',adv4B:'ஜன்னல்களை மூடி, காற்று வடிகட்டியைப் பயன்படுத்தவும்.',alertT:'முக்கிய மாற்றங்களை அறிவிக்கவும்',alertS:'முக்கிய AQI மாற்றங்களுக்கு எச்சரிக்கை — Airly மூடியிருந்தாலும்.',nearbyT:'அருகிலுள்ள கண்காணிப்பு நிலையங்கள்',nearbyS:'நிலையத்தைத் தட்டி உங்கள் டாஷ்போர்டாக்குங்கள்.',newsT:'காற்றை பாதிக்கும் நிகழ்வுகள்',newsS:'உங்கள் பகுதிக்கான சமீபத்திய காற்றுத்தர செய்திகள்.',nonews:'சமீபத்திய செய்திகள் இல்லை.',settingsT:'முக்கியமான எச்சரிக்கைகள்',settingsP:'விருப்பங்கள் இந்தச் சாதனத்திலேயே சேமிக்கப்படும். Airly மூடியிருந்தாலும் அறிவிப்புகள் வரலாம்.',deltaL:'AQI இவ்வளவு மாறினால் அறிவிக்கவும்',notifT:'உலாவி அறிவிப்புகள்',notifS:'குறிப்பிடத்தக்க AQI மாற்றங்களை அறிவிக்கவும்',sensT:'உணர்திறன் சுகாதார விவரம்',sensS:'கடுமையான தனிப்பட்ட வழிகாட்டுதல்',localeL:'உள்ளூர் செய்திகள்',save:'சேமிக்கவும்',saved:'விருப்பங்கள் சேமிக்கப்பட்டன.',locA:'தோராயமான IP இருப்பிடம் பயன்படுத்தப்படுகிறது',locB:'இருப்பிடம் கிடைக்கவில்லை — கோலாலம்பூர் பயன்படுத்தப்படுகிறது.',errA:'நேரடி டோக்கன் அமைக்கப்படவில்லை — மாதிரி தரவு காட்டப்படுகிறது.',errB:'நேரடி தரவு தற்காலிகமாக கிடைக்கவில்லை.',noNotif:'இந்த உலாவியில் அறிவிப்புகள் ஆதரிக்கப்படவில்லை.',aiStamp:'மேலே உள்ள அறிவுரை AI ஆல் உருவாக்கப்பட்டது — முக்கியத் தகவலைச் சரிபார்க்கவும்',updated:'நிலையம் புதுப்பிக்கப்பட்டது',myapi:'API (MY) தோராயம்',trend:'போக்கு & கணிப்பு',trendT:'PM2.5 கணிப்பு',trendS:'தினசரி முன்னறிவிப்பு வரம்பும் சராசரியும்',trendNone:'இந்த நிலையத்திற்கு கணிப்பு இல்லை.',trendSrc:'கணிப்பு: World Air Quality Index Project.',reset:'மீட்டமை',hsHint:'iPhone/iPad-இல்: Share → Add to Home Screen செய்து, அந்த ஐகானில் இருந்து Airly-ஐத் திறக்கவும்.',searchT:'நகரத்தைத் தேடு',searchPh:'நகரம் அல்லது நிலையம்…',noResults:'நிலையங்கள் இல்லை.',locBlocked:'இருப்பிடம் தடுக்கப்பட்டுள்ளது. உலாவியின் தள அமைப்புகளில் அனுமதிக்கவும் — iPhone-இல் Settings → உலாவி ஆப் → Location-ஐயும் சரிபார்க்கவும்.',yourloc:'என் இருப்பிடம் (பெரிதாக்க)',approx:'தோராய '},
-zh:{settingsBtn:'设置',now:'空气质量',nearby:'附近',news:'新闻',sample:'示例数据',live:'实时读数',monitor:'最近监测站',usaqi:'美国 AQI',fromyou:'公里外',reading:'当前读数',humidity:'湿度',wind:'风速',lvl0:'良好',lvl1:'中等',lvl2:'敏感人群不健康',lvl3:'不健康',lvl4:'非常不健康',lvl5:'危险',adv0T:'适合户外活动',adv0B:'可照常进行日常活动。',adv1T:'总体可接受',adv1B:'特别敏感者可减少长时间剧烈活动。',adv1Bs:'长时间户外活动时注意身体反应。',adv2T:'减少长时间活动',adv2B:'敏感人群应限制长时间户外活动。',adv2Bs:'保持轻度活动，建议佩戴口罩。',adv3T:'减少外出时间',adv3B:'所有人应减少剧烈户外活动。',adv4T:'尽量留在室内',adv4B:'关闭门窗，使用空气净化器，避免户外活动。',alertT:'重要变化提醒',alertS:'重要 AQI 变化提醒 — 即使 Airly 已关闭。',nearbyT:'附近的监测站',nearbyS:'点按站点设为您的仪表板。',newsT:'影响空气的动态',newsS:'您所在地区最新的雾霾与空气质量报道。',nonews:'暂无最新报道。',settingsT:'重要提醒',settingsP:'偏好仅保存在本设备上。即使 Airly 已关闭也能收到通知。',deltaL:'AQI 变化达到以下值时提醒',notifT:'浏览器通知',notifS:'提醒我显著的 AQI 变化',sensT:'敏感健康档案',sensS:'更严格的个人建议',localeL:'本地新闻',save:'保存设置',saved:'偏好已保存在本设备上。',locA:'正在使用大致的 IP 位置',locB:'无法获取位置 — 使用吉隆坡。',errA:'未配置实时令牌 — 显示示例数据。',errB:'实时数据暂不可用。',noNotif:'此浏览器不支持通知。',aiStamp:'以上建议由 AI 生成 — 请核实重要信息',updated:'监测站更新于',myapi:'API（马来西亚）约',trend:'趋势与预报',trendT:'PM2.5 展望',trendS:'每日预报范围与平均值',trendNone:'该站点暂无预报。',trendSrc:'预报来自 World Air Quality Index Project。',reset:'重置',hsHint:'在 iPhone/iPad 上：分享 → 添加到主屏幕，再从该图标打开 Airly 即可启用通知。',searchT:'搜索城市',searchPh:'城市或监测站名称…',noResults:'未找到监测站。',locBlocked:'位置权限被阻止。请在浏览器的网站设置中允许 — iPhone 上还需检查 设置 → 浏览器应用 → 位置。',yourloc:'我的位置（放大）',approx:'大约 '}};
-
-
-const $ = q=>document.querySelector(q), $$ = q=>[...document.querySelectorAll(q)];
-const esc = v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const safeUrl = u=>/^https?:\/\//i.test(u||'') ? esc(u) : '#';
-const ICONS={
- search:'<circle cx="10" cy="10" r="6"/><path d="m15 15 5 5"/>',
- settings:'<path d="M4 7h16M4 17h16"/><circle cx="9" cy="7" r="3" fill="var(--paper)"/><circle cx="16" cy="17" r="3" fill="var(--paper)"/>',
- location:'<circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/><path d="M12 2v4m0 12v4M2 12h4m12 0h4"/>',
- refresh:'<path d="M20 7v5h-5M4 17v-5h5"/><path d="M6 7a7 7 0 0 1 12-1l2 6M4 12l2 6a7 7 0 0 0 12-1"/>',
- air:'<path d="M3 8h12a3 3 0 1 0-3-3M3 12h16a3 3 0 1 1-3 3M3 16h5a3 3 0 1 1-3 3"/>',
- map:'<path d="m3 5 6-2 6 3 6-2v15l-6 2-6-3-6 2ZM9 3v15M15 6v15"/>',
- news:'<path d="M4 3h16v18H4zM8 7h8M8 11h8M8 15h3M14 15h2M8 18h8"/>',
- chart:'<path d="M4 3v17h17M7 15l4-5 4 2 6-7"/>',
- arrow:'<path d="M5 12h14m-5-5 5 5-5 5"/>'
-};
-const icon=n=>'<svg viewBox="0 0 24 24" aria-hidden="true">'+ICONS[n]+'</svg>';
-$$('[data-icon]').forEach(e=>e.innerHTML=icon(e.dataset.icon));
-const storage={
- get(k){try{return JSON.parse(localStorage.getItem(k)||'null')}catch{return null}},
- set(k,v){try{localStorage.setItem(k,JSON.stringify(v));return true}catch{return false}}
-};
-const saved=storage.get('airly-settings')||{};
-let settings={delta:Math.min(100,Math.max(10,Number(saved.delta)||25)),browser:!!saved.browser,sensitive:!!saved.sensitive,locale:/^(AUTO|MY|SG|ID|TH|VN|PH|BN|KH|LA|MM|TL)$/.test(saved.locale)?saved.locale:'AUTO',lang:['en','ms','ta','zh'].includes(saved.lang)?saved.lang:'en',background:!!saved.background};
-settings.index=['auto','my','us'].includes(saved.index)?saved.index:'auto';
-settings.backgroundStation=typeof saved.backgroundStation==='string'?saved.backgroundStation:null;
-let lang=settings.lang;
-const t=k=>I18N[lang]?.[k]||I18N.en[k]||k;
-const EXTRA={
- en:{now:'Air',mapTab:'Map',forecastTab:'Forecast',searchPh:'City name…',lvl2:'Unhealthy for sensitive groups',loading:'Checking the air',loadingB:'Fetching the latest available station reading.',noData:'Reading unavailable',retry:'Try again',matched:'Station near your location',selected:'Selected station',fresh:'Latest reported reading',stale:'Older station reading',unknownTime:'Measurement time unavailable',failed:'Refresh failed · last reading shown',offline:'Offline · last reading shown',fetching:'Updating',ago:'ago',privacyNote:'Preferences stay on this device.',settingsNote:'Your preferences are stored on this device.',foregroundNote:'Checks for changes while this app is open and connected.',backgroundTitle:'Background alerts',backgroundNote:'Opt in to store this station and your push subscription on the server for scheduled checks. Turn off to delete the subscription.',details:'Reading details',indexNote:'PM2.5 and PM10 values are pollutant AQI sub-indices, not concentrations in µg/m³. US AQI is not Malaysia’s official API.',spatialNote:'A station measures air at its own location. Nearby conditions can differ.',olderNote:'This reading is over 3 hours old. It may not describe current conditions.',noTimeNote:'The provider has not supplied a verified measurement time.',range:'Range',average:'Average',forecastNote:'PM2.5 AQI forecast, not a measured concentration. Dates follow the station’s local time.',noForecast:'No current forecast is available. Older forecasts are not shown as upcoming conditions.',locationPrecision:'Location accuracy',approxLabel:'Approximate IP area',locationAction:'Use my location',newsFailed:'News could not be loaded. Try again.',nearbyEmpty:'No stations loaded in this area. Open the map or search for a city.',checked:'Checked',alertActive:'Alerts are on',alertInactive:'Set a change alert',alertDescription:'Choose your AQI threshold in settings.',unavailableAdvice:'Check the reading time and your local environment agency for current guidance.',stationLoading:'Loading station details',sampleRemoved:'No sample readings are displayed.',mapHint:'US AQI · tap a station',mapUnavailable:'Map could not load. Station readings are still available.',allClear:'No valid AQI reported',advisorySource:'Guidance follows US AQI health categories.',geoFail:'Precise location unavailable. Using an approximate area.',permissionDenied:'Notifications are blocked. Allow them in browser settings.',notSaved:'Settings work for this session; browser storage is unavailable.',oldForecast:'Forecast unavailable',reportFrom:'Reported by',defaultArea:'Kuala Lumpur · default area',noAlertsStale:'Alerts only use dated readings from the same station, no more than 3 hours old.',bgFailed:'Background alerts could not be saved; foreground alerts remain available.',navForecast:'Forecast',dataError:'Unable to retrieve a valid station reading.'},
- ms:{now:'Udara',mapTab:'Peta',forecastTab:'Ramalan',searchPh:'Nama bandar…',loading:'Menyemak udara',noData:'Bacaan tidak tersedia',retry:'Cuba lagi',matched:'Stesen berhampiran anda',selected:'Stesen dipilih',fresh:'Bacaan terkini dilaporkan',stale:'Bacaan stesen lama',unknownTime:'Masa bacaan tidak tersedia',fetching:'Mengemas kini',privacyNote:'Tetapan disimpan pada peranti ini.',settingsNote:'Tetapan disimpan pada peranti ini.',foregroundNote:'Semakan dibuat semasa aplikasi dibuka dan bersambung.',details:'Butiran bacaan',average:'Purata',range:'Julat',locationAction:'Guna lokasi saya',mapHint:'AQI AS · ketik stesen',defaultArea:'Kuala Lumpur · kawasan lalai',alertInactive:'Tetapkan amaran',alertActive:'Amaran diaktifkan'},
- ta:{now:'காற்று',mapTab:'வரைபடம்',forecastTab:'முன்னறிவிப்பு',searchPh:'நகரத்தின் பெயர்…',loading:'காற்றைச் சரிபார்க்கிறது',noData:'அளவீடு கிடைக்கவில்லை',retry:'மீண்டும் முயல்க',matched:'உங்கள் அருகிலுள்ள நிலையம்',selected:'தேர்ந்தெடுத்த நிலையம்',fresh:'சமீபத்திய அளவீடு',stale:'பழைய அளவீடு',privacyNote:'விருப்பங்கள் இந்தச் சாதனத்தில் சேமிக்கப்படும்.',foregroundNote:'செயலி திறந்திருக்கும் போது மாற்றங்களைச் சரிபார்க்கும்.',details:'அளவீட்டு விவரங்கள்',average:'சராசரி',range:'வரம்பு',locationAction:'எனது இருப்பிடம்',alertInactive:'எச்சரிக்கை அமைக்கவும்'},
- zh:{now:'空气',mapTab:'地图',forecastTab:'预报',searchPh:'城市名称…',loading:'正在查询空气质量',noData:'暂无读数',retry:'重试',matched:'附近监测站',selected:'所选监测站',fresh:'最新报告读数',stale:'较旧读数',unknownTime:'测量时间未知',fetching:'正在更新',privacyNote:'偏好设置保存在此设备。',settingsNote:'偏好设置保存在此设备。',foregroundNote:'应用打开且联网时检查变化。',details:'读数详情',average:'平均值',range:'范围',locationAction:'使用我的位置',mapHint:'美国 AQI · 点击监测站',defaultArea:'吉隆坡 · 默认区域',alertInactive:'设置变化提醒',alertActive:'提醒已开启'}
-};
-for(const [l,values] of Object.entries(EXTRA))Object.assign(I18N[l],values);
-Object.assign(I18N.en,{myapi:'Malaysia API · DOE',indexL:'Air quality index',indexAuto:'Automatic · Malaysia API in Malaysia',indexMY:'Malaysia API · official DOE stations',indexUS:'US AQI · worldwide stations',myNote:'Official API reported by Malaysia’s Department of Environment, not a conversion from US AQI. API and US AQI use different methods and must not be compared directly.',myForecast:'This DOE feed does not provide an API forecast. We do not substitute a US AQI forecast.',myMetrics:'Dominant pollutant',mySource:'Official source',myMap:'Malaysia API · DOE stations',myGuide:'Follow the Malaysian API health guidance.',myMissing:'No DOE stations in this view. Search another city or choose US AQI for worldwide coverage.',alertDescription:'Choose an index-point change in settings.',deltaL:'Notify when the index changes by',notifS:'Alert me to meaningful changes at this station'});
-Object.assign(I18N.ms,{myapi:'API Malaysia · JAS',indexL:'Indeks kualiti udara',indexAuto:'Automatik · API untuk Malaysia',indexMY:'API Malaysia · stesen rasmi JAS',indexUS:'AQI AS · stesen seluruh dunia',myNote:'API rasmi Jabatan Alam Sekitar Malaysia, bukan penukaran AQI AS. Kaedah pengiraan berbeza dan nilainya tidak boleh dibandingkan secara langsung.',myForecast:'Suapan JAS ini tidak menyediakan ramalan API. Ramalan AQI AS tidak digunakan sebagai ganti.',myMetrics:'Pencemar dominan',mySource:'Sumber rasmi',myMap:'API Malaysia · stesen JAS',myGuide:'Ikuti panduan kesihatan API Malaysia.',deltaL:'Maklumkan apabila indeks berubah sebanyak',alertDescription:'Pilih perubahan mata indeks dalam tetapan.'});
-Object.assign(I18N.ta,{myapi:'மலேசிய API · DOE',indexL:'காற்றுத் தரக் குறியீடு',indexAuto:'தானாக · மலேசியாவில் API',indexMY:'மலேசிய API · DOE',indexUS:'US AQI · உலகளவில்'});
-Object.assign(I18N.zh,{myapi:'马来西亚 API · 环境局',indexL:'空气质量指数',indexAuto:'自动 · 马来西亚使用 API',indexMY:'马来西亚 API · 官方监测站',indexUS:'美国 AQI · 全球监测站',myNote:'马来西亚环境局发布的官方 API，并非由美国 AQI 换算。两者计算方式不同，不能直接比较。',myForecast:'此环境局数据源不提供 API 预报，不会用美国 AQI 预报替代。',myMetrics:'主要污染物',mySource:'官方来源',myMap:'马来西亚 API · 环境局监测站',myGuide:'请遵循马来西亚 API 健康指引。',deltaL:'指数变化达到以下点数时提醒',alertDescription:'在设置中选择指数变化点数。'});
-const COLORS=['#287750','#94710b','#b86221','#b64436','#81406c','#721f40'];
-const MY_COLORS=['#2369b5','#357b28',null,'#8c7100','#b75e16','#b83131'];
-const band=(a,index='us')=>!Number.isFinite(a)?-1:a<=50?0:a<=100?1:index!=='my'&&a<=150?2:a<=200?3:a<=300?4:5;
-const color=(a,index='us')=>(index==='my'?MY_COLORS:COLORS)[band(a,index)]||'#62746a';
-const indexLabel=d=>t(d?.index==='my'?'myapi':'usaqi');
-const stationKey=d=>(d.index||'us')+':'+d.uid;
-const quality=d=>{
- const time=Date.parse(d?.time||'');
- if(!Number.isFinite(time)||time>Date.now()+600000)return 'unknown';
- return Date.now()-time>10800000?'stale':'fresh';
-};
-const haversine=(a,b)=>{
- if(!a||!b||![a.lat,a.lon,b.lat,b.lon].every(Number.isFinite))return null;
- const rad=Math.PI/180,dy=(b.lat-a.lat)*rad,dx=(b.lon-a.lon)*rad;
- const h=Math.sin(dy/2)**2+Math.cos(a.lat*rad)*Math.cos(b.lat*rad)*Math.sin(dx/2)**2;
- return 6371*2*Math.atan2(Math.sqrt(Math.min(1,h)),Math.sqrt(Math.max(0,1-h)));
-};
-const distanceText=d=>d===null?'':d<1?Math.round(d*1000)+' m':(d<10?d.toFixed(1):Math.round(d))+' km';
-const ageText=stamp=>{const diff=Date.now()-Date.parse(stamp||'');if(!Number.isFinite(diff)||diff< -600000)return t('unknownTime');const min=Math.max(0,Math.floor(diff/60000));return new Intl.RelativeTimeFormat(lang,{numeric:'auto'}).format(min<60?-min:min<1440?-Math.floor(min/60):-Math.floor(min/1440),min<60?'minute':min<1440?'hour':'day')};
-const dateText=stamp=>{const n=Date.parse(stamp||'');return Number.isFinite(n)?new Date(n).toLocaleString(lang,{dateStyle:'medium',timeStyle:'short'}):t('unknownTime')};
-const latestForecast=d=>{const offset=/^([+-])(\d\d):(\d\d)$/.exec(d?.timezone||'');const minutes=offset?(+offset[2]*60 + +offset[3])*(offset[1]==='-'?-1:1):0;const today=new Date(Date.now()+minutes*60000).toISOString().slice(0,10);return (d?.forecast||[]).filter(x=>x.day>=today&&Number.isFinite(x.avg)).sort((a,b)=>a.day.localeCompare(b.day))};
-let current=null,stations=[],userLocation=null,searchLocation=null,map=null,userMarker=null,accuracyCircle=null;
-let activeView='now',requestMode='home',selection=null,loading=false,loadError='',lastSuccess=0,lastAttempt=0;
-let detailController,detailSequence=0,mapController,mapSequence=0,areaSequence=0,locationSequence=0,searchController,searchSequence=0;
-let mapTimer,refreshTimer,lastMapKey='',lastMapTime=0,backgroundReady=false,serviceRegistration=null,geoBusy=false;
-const markers=new Map(),baseline=new Map(),scrollPositions={};
-const indexQuery=()=>{const country=searchLocation?.country||userLocation?.country,index=settings.index==='auto'&&current?.index?current.index:settings.index;return '&index='+index+(country?'&country='+encodeURIComponent(country):'')};
-const mapHint=()=>stations.some(s=>s.index==='my')?t('myMap'):current?.index==='my'?t('myMissing'):t('mapHint');
-const reduceMotion=matchMedia('(prefers-reduced-motion: reduce)').matches;
-async function requestJSON(path,signal,timeout=12000){
- const controller=new AbortController(),abort=()=>controller.abort();signal?.addEventListener('abort',abort,{once:true});
- if(signal?.aborted)controller.abort();
- const timer=setTimeout(abort,timeout);
- try{const r=await fetch(path,{signal:controller.signal,cache:'no-store'});const data=await r.json();if(!r.ok)throw Object.assign(new Error(data.error||t('dataError')),{status:r.status});return data}
- finally{clearTimeout(timer);signal?.removeEventListener('abort',abort)}
-}
-function applyI18n(){
- document.documentElement.lang=lang;document.body.classList.toggle('lang-ta',lang==='ta');
- $$('[data-i18n]').forEach(el=>el.textContent=t(el.dataset.i18n));$('#sinput').placeholder=t('searchPh');
- $('#map-hint').textContent=mapHint();$('#lang').value=lang;
-}
-function toast(text){$('#toast').textContent=text;$('#toast').hidden=false;clearTimeout(toast.timer);toast.timer=setTimeout(()=>$('#toast').hidden=true,4500)}
-function advice(a,index='us'){
- const i=band(a,index);if(i<0)return [t('noData'),t('unavailableAdvice')];
- if(i===5)return [t('adv4T'),({en:'Everyone should avoid outdoor physical activity. Stay inside with cleaner air and follow local health advisories.',ms:'Semua orang perlu elakkan aktiviti fizikal di luar. Kekal di dalam dengan udara bersih dan ikut nasihat kesihatan tempatan.',ta:'வெளிப்புற உடற்பயிற்சியை அனைவரும் தவிர்க்கவும். சுத்தமான உட்புறக் காற்றில் இருந்து உள்ளூர் சுகாதார ஆலோசனைகளைப் பின்பற்றவும்.',zh:'所有人应避免户外体力活动，留在空气较清洁的室内并遵循当地健康建议。'})[lang]];
- return [t('adv'+Math.min(i,4)+'T'),t('adv'+Math.min(i,4)+((i===1||i===2)&&settings.sensitive?'Bs':'B'))]
-}
-function connectionText(){
- if(navigator.onLine===false)return 'Offline';
- if(loading)return t('fetching')+'…';
- if(loadError)return t('retry');
- return lastSuccess?t('checked')+' '+new Date(lastSuccess).toLocaleTimeString(lang,{hour:'2-digit',minute:'2-digit'}):t('loading')+'…';
-}
-function render(){
- $('#connection').textContent=connectionText();$('#refresh').classList.toggle('spin',loading);$('#refresh').disabled=loading;
- $('#place').textContent=searchLocation?.name||userLocation?.label||t('defaultArea');
- $('#place').title=userLocation?.accuracy?t('locationPrecision')+' ±'+Math.round(userLocation.accuracy)+' m':userLocation?.approx?t('approxLabel'):'';
- const now=$('#now'),scroll=$('#card').scrollTop,open=now.querySelector('details')?.open;
- if(!current){
-  now.innerHTML='<div class="empty"><p class="eyebrow">Airly by Ordinexis</p><h1>'+esc(loading?t('loading'):t('noData'))+'</h1><p>'+esc(loading?t('loadingB'):loadError||t('dataError'))+'</p>'+(loading?'<div class="skeleton"></div><div class="skeleton score-load"></div><div class="skeleton"></div>':'<button class="primary" id="retry">'+esc(t('retry'))+'</button>')+'</div>';
-  $('#retry')?.addEventListener('click',()=>refresh(true));
- }else{
-  const q=quality(current),valid=Number.isFinite(current.aqi),[title,body]=advice(current.aqi,current.index),c=color(current.aqi,current.index),my=current.index==='my',bands=my?[0,1,3,4,5]:[0,1,2,3,4,5];
-  const status=current.detail===false?t('stationLoading'):loadError?t(navigator.onLine===false?'offline':'failed'):t(q==='fresh'?'fresh':q==='stale'?'stale':'unknownTime');
-  const d=haversine(userLocation,current);
-  const attribution=(current.attribution||[]).map(a=>'<a href="'+safeUrl(a.url)+'" target="_blank" rel="noopener noreferrer">'+esc(a.name)+'</a>').join(' · ');
-  now.innerHTML='<div class="live" data-quality="'+(loadError?'stale':q)+'"><span class="status-dot"></span><span>'+esc(status)+(current.time?' · '+esc(ageText(current.time)):'')+'</span></div>'+
-   '<p class="eyebrow">'+esc(t(requestMode==='home'?'matched':'selected'))+'</p><h1 class="station-name">'+esc(current.name)+'</h1>'+
-   '<p class="distance">'+(d===null?esc(t('spatialNote')):esc(userLocation.approx?(d<1?'<1 km':'≈ '+Math.round(d)+' km'):distanceText(d))+' '+esc(({en:'from you',ms:'dari anda',ta:'தொலைவில்',zh:'距您'})[lang])+(userLocation.approx?' · '+esc(t('approxLabel')):userLocation.accuracy?' · ±'+Math.round(userLocation.accuracy)+' m':''))+'</p>'+
-   '<div class="score"><strong style="color:'+c+'">'+(valid?current.aqi:'—')+'</strong><span><b>'+esc(valid?t('lvl'+band(current.aqi,current.index)):t('noData'))+'</b>'+esc(indexLabel(current))+'</span></div>'+
-   '<div class="aqi-scale" style="grid-template-columns:repeat('+bands.length+',1fr)" aria-label="'+esc(indexLabel(current))+' category scale">'+bands.map(i=>'<i class="'+(i===band(current.aqi,current.index)?'active':'')+'" style="background:'+(my?MY_COLORS:COLORS)[i]+'"></i>').join('')+'</div>'+
-   (q!=='fresh'?'<p class="notice">'+esc(t(q==='stale'?'olderNote':'noTimeNote'))+'</p>':'')+
-   '<div class="advice" style="border-color:'+c+'"><h2>'+esc(q==='fresh'?title:t('details'))+'</h2><p>'+esc(q==='fresh'?body:t('unavailableAdvice'))+'</p></div>'+
-   (my?'<div class="metrics" style="grid-template-columns:1fr 1fr"><div class="metric"><span>'+esc(t('myMetrics'))+'</span><b>'+esc(current.dominant||'—')+'</b></div><div class="metric"><span>'+esc(t('mySource'))+'</span><b>DOE</b><small>'+esc(current.stationCode||'APIMS')+'</small></div></div>':'<div class="metrics"><div class="metric"><span>PM2.5</span><b>'+(current.pm25??'—')+'</b><small>AQI sub-index</small></div><div class="metric"><span>'+esc(t('humidity'))+'</span><b>'+(current.humidity??'—')+'</b><small>%</small></div><div class="metric"><span>'+esc(t('wind'))+'</span><b>'+(current.wind??'—')+'</b><small>m/s</small></div></div>')+
-   '<details class="reading-details"'+(open?' open':'')+'><summary>'+esc(t('details'))+'</summary><p>'+esc(t('updated'))+': '+esc(dateText(current.time))+'</p><p>'+esc(t(my?'myNote':'indexNote'))+'</p><p>'+esc(t('spatialNote'))+'</p>'+
-   '<div class="pollutants">'+Object.entries(current.pollutants||{}).filter(([k,v])=>v!==null).map(([k,v])=>'<span>'+esc(({pm25:'PM2.5',pm10:'PM10',o3:'O₃',no2:'NO₂',so2:'SO₂',co:'CO'})[k]||k)+' <b>'+v+'</b></span>').join('')+'</div>'+
-   (current.dominant?'<p>Dominant pollutant: '+esc(current.dominant.toUpperCase().replace('PM25','PM2.5'))+'</p>':'')+
-   (current.temperature!==null&&current.temperature!==undefined?'<p>'+current.temperature+' °C</p>':'')+
-   '<p>'+esc(t(my?'myGuide':'advisorySource'))+' <a href="'+(my?'https://www.doe.gov.my/2021/10/04/english-air-pollutant-index-api/':'https://www.airnow.gov/aqi/aqi-basics/')+'" target="_blank" rel="noopener noreferrer">'+(my?'DOE Malaysia':'AirNow')+'</a></p>'+
-   (attribution?'<p>'+esc(t('reportFrom'))+': '+attribution+'</p>':'')+'</details>'+
-   '<button class="alert" id="alert">'+icon('settings')+'<span><b>'+esc(t(settings.browser?'alertActive':'alertInactive'))+'</b><small>'+esc(t('alertDescription'))+'</small></span>'+icon('arrow')+'</button>';
-  $('#alert').onclick=()=>openModal('modal');
- }
- $('#map-station').textContent=current?.name||t('noData');$('#map-aqi').textContent=current?.aqi??'—';$('#map-aqi').style.color=color(current?.aqi,current?.index);
- $('#map-reading-label').textContent=indexLabel(current)+(current?.time?' · '+ageText(current.time):'');$('#map-hint').textContent=mapHint();
- $('#data-source').textContent=current?.index==='my'?'DOE Malaysia · APIMS':'World Air Quality Index Project';$('#data-source').href=current?.index==='my'?'https://eqms.doe.gov.my/APIMS/main':'https://waqi.info';
- $('#card').scrollTop=scroll;
- if(activeView==='nearby')renderNearby();if(activeView==='trend')renderTrend();
- updateMarkers();
-}
-async function loadReading(query,summary=null){
- const seq=++detailSequence;detailController?.abort();detailController=new AbortController();
- loading=true;loadError='';lastAttempt=Date.now();
- if(summary){current={...summary,detail:false,time:null,pm25:null,wind:null,humidity:null};}
- render();
- try{
-  const next=await requestJSON('/api/air?'+query,detailController.signal);
-  if(seq!==detailSequence)return;
-  if(!Number.isFinite(next.aqi)||next.aqi<0||!(Number.isFinite(next.uid)||next.index==='my'&&/^my:[A-Z0-9_-]{1,20}$/.test(next.uid)))throw Error(t('dataError'));
-  current={...next,detail:true};selection={uid:next.uid,lat:next.lat,lon:next.lon};lastSuccess=Date.now();loadError='';
-  checkAlert(next);
-  // The detail endpoint is authoritative; replace, rather than mixing it with the map summary.
-  const i=stations.findIndex(s=>s.uid===next.uid);if(i<0)stations.push(next);else stations[i]=next;
- }catch(e){if(seq!==detailSequence)return;loadError=navigator.onLine===false?'Offline':e.message||t('dataError')}
- finally{if(seq===detailSequence){loading=false;render();scheduleRefresh()}}
-}
-function selectStation(s){
- locationSequence++;
- requestMode='station';selection={uid:s.uid,lat:s.lat,lon:s.lon};
- loadReading('uid='+encodeURIComponent(s.uid),s);
- if(activeView!=='map')showTab('now');
-}
-async function refresh(force=false){
- if(!force&&(document.hidden||loading||navigator.onLine===false))return;
- if(selection?.uid)await loadReading('uid='+selection.uid);
- else{const p=searchLocation||userLocation||{lat:3.139,lon:101.687};await loadReading('lat='+p.lat+'&lon='+p.lon+indexQuery())}
- if(map&&(activeView==='map'||innerWidth>820))loadViewport(true);
-}
-function scheduleRefresh(){clearTimeout(refreshTimer);if(!document.hidden&&navigator.onLine!==false)refreshTimer=setTimeout(()=>refresh(),loadError?60000:300000)}
-function checkAlert(d){
- if(!settings.browser||(settings.background&&settings.backgroundStation===stationKey(d))||quality(d)!=='fresh')return;
- const key=stationKey(d),previous=baseline.get(key),stamp=Date.parse(d.time);
- if(!previous||Date.now()-previous.time>10800000){baseline.set(key,{aqi:d.aqi,time:stamp});return}
- if(stamp<=previous.time)return;
- if(Math.abs(d.aqi-previous.aqi)>=settings.delta){notifyChange(d,previous.aqi);baseline.set(key,{aqi:d.aqi,time:stamp})}
-}
-async function notifyChange(d,old){
- if(typeof Notification==='undefined'||Notification.permission!=='granted')return;
- const direction=d.aqi>old?'increased':'decreased',options={body:d.name+': '+indexLabel(d)+' '+direction+' by '+Math.abs(d.aqi-old)+' to '+d.aqi+'.',tag:'airly-'+stationKey(d),icon:'/icon-180.png'};
- try{if(serviceRegistration)await serviceRegistration.showNotification('Airly by Ordinexis',options);else new Notification('Airly by Ordinexis',options)}catch{}
-}
-function initMap(){
- if(!window.L){$('#map').innerHTML='<p class="map-status">'+esc(t('mapUnavailable'))+'</p>';return}
- $('#map').replaceChildren();
- map=L.map('map',{zoomControl:false,minZoom:3,maxZoom:18,preferCanvas:true,zoomAnimation:!reduceMotion,fadeAnimation:!reduceMotion,worldCopyJump:true}).setView([3.139,101.687],8);
- L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>',updateWhenIdle:true,keepBuffer:2}).addTo(map);
- L.control.zoom({position:'bottomleft'}).addTo(map);
- map.on('moveend',()=>{clearTimeout(mapTimer);mapTimer=setTimeout(()=>loadViewport(),350)});
- if(typeof ResizeObserver!=='undefined')new ResizeObserver(()=>map.invalidateSize({pan:false})).observe($('#map'));
-}
-function centreMap(p=userLocation||selection){if(!map||!p||!Number.isFinite(p.lat)||!Number.isFinite(p.lon))return;map.setView([p.lat,p.lon],11,{animate:!reduceMotion});loadViewport()}
-function drawUser(){
- if(!map||!userLocation)return;
- if(userMarker)map.removeLayer(userMarker);if(accuracyCircle)map.removeLayer(accuracyCircle);
- const p=userLocation;
- userMarker=L.marker([p.lat,p.lon],{interactive:false,keyboard:false,zIndexOffset:1000,icon:L.divIcon({className:'',html:'<div class="user-dot"></div>',iconSize:[16,16],iconAnchor:[8,8]})}).addTo(map);
- if(p.accuracy>0)accuracyCircle=L.circle([p.lat,p.lon],{radius:p.accuracy,color:'#257bc2',weight:1,fillOpacity:.07,interactive:false}).addTo(map);
-}
-function updateMarkers(){
- if(!map)return;
- const center=map.getCenter(),origin={lat:center.lat,lon:center.lng},bounds=map.getBounds().pad(.15);
- const list=stations.filter(s=>Number.isFinite(s.aqi)&&Number.isFinite(s.lat)&&Number.isFinite(s.lon)&&bounds.contains([s.lat,s.lon])).sort((a,b)=>haversine(origin,a)-haversine(origin,b)).slice(0,120);
- if(current&&Number.isFinite(current.lat)&&Number.isFinite(current.lon)&&!list.some(s=>s.uid===current.uid))list.push(current);
- const seen=new Set();
- for(const s of list){
-  const key=s.uid;seen.add(key);const active=key===current?.uid,signature=s.aqi+'|'+active+'|'+s.lat+'|'+s.lon+'|'+lang;
-  let entry=markers.get(key);
-  if(!entry){
-   const marker=L.marker([s.lat,s.lon],{title:s.name+' · '+indexLabel(s)+' '+s.aqi}).addTo(map);
-   entry={marker,station:s,signature:''};markers.set(key,entry);marker.on('click',()=>selectStation(entry.station));
-  }
-  entry.station=s;
-  if(signature!==entry.signature){
-   entry.marker.setLatLng([s.lat,s.lon]).setIcon(L.divIcon({className:'',html:'<div class="map-bubble'+(active?' active':'')+'" style="--aqi:'+color(s.aqi,s.index)+'">'+s.aqi+'</div>',iconSize:[38,34],iconAnchor:[19,43]})).setZIndexOffset(active?500:0);
-   entry.marker.unbindTooltip().bindTooltip(esc(s.name)+' · '+esc(indexLabel(s))+' '+s.aqi,{direction:'top'});entry.signature=signature;
-  }
- }
- for(const [key,e]of markers)if(!seen.has(key)){map.removeLayer(e.marker);markers.delete(key)}
-}
-async function loadViewport(force=false){
- if(!map||document.hidden||(innerWidth<=820&&activeView!=='map'))return;
- const b=map.getBounds(),c=map.getCenter(),lat=Math.max(-65,Math.min(65,c.lat)),lon=((c.lng+180)%360+360)%360-180;
- const dy=Math.min(19,(b.getNorth()-b.getSouth())/2),dx=Math.min(29,(b.getEast()-b.getWest())/2);
- const box=[Math.max(-85,lat-dy),Math.max(-180,lon-dx),Math.min(85,lat+dy),Math.min(180,lon+dx)].map(x=>+x.toFixed(4));
- if(box[0]>=box[2]||box[1]>=box[3])return;
- const key=box.join(','),cacheKey=key+indexQuery();if(!force&&cacheKey===lastMapKey&&Date.now()-lastMapTime<300000){updateMarkers();return}
- const seq=++mapSequence;mapController?.abort();mapController=new AbortController();
- try{
-  const inc=await requestJSON('/api/air?scope=area&bbox='+key+indexQuery(),mapController.signal);
-  if(seq!==mapSequence||!Array.isArray(inc))return;
-  lastMapKey=cacheKey;lastMapTime=Date.now();
-  const merged=new Map(stations.map(s=>[s.uid,s]));inc.forEach(s=>merged.set(s.uid,s));
-  if(current?.detail)merged.set(current.uid,current);
-  stations=[...merged.values()].sort((a,b)=>(haversine(userLocation||originPoint(),a)??Infinity)-(haversine(userLocation||originPoint(),b)??Infinity)).slice(0,600);
-  $('#map-hint').textContent=mapHint();updateMarkers();if(activeView==='nearby')renderNearby();
- }catch(e){if(seq===mapSequence)$('#map-hint').textContent='Station map could not refresh'}
-}
-function originPoint(){return searchLocation||userLocation||selection||{lat:3.139,lon:101.687}}
-async function loadArea(p,seq){
- const areaSeq=++areaSequence;
- try{const inc=await requestJSON('/api/air?scope=area&lat='+p.lat+'&lon='+p.lon+indexQuery());
- if(seq!==locationSequence||areaSeq!==areaSequence||!Array.isArray(inc))return;stations=inc;if(current?.detail&&!stations.some(s=>s.uid===current.uid))stations.push(current);
- updateMarkers();if(activeView==='nearby')renderNearby()}catch{}
-}
-async function useArea(p,mode='home'){
- const seq=++locationSequence;selection=null;requestMode=mode;loadError='';current=null;stations=[];lastMapKey='';mapSequence++;mapController?.abort();
- if(mode==='home'){userLocation=p;searchLocation=null;drawUser()}else searchLocation=p;
- render();if(map){map.setView([p.lat,p.lon],10,{animate:false});}
- loadArea(p,seq);await loadReading('lat='+p.lat+'&lon='+p.lon+indexQuery());
- if(seq===locationSequence&&current?.index==='us'&&settings.index==='auto'&&(p.country||userLocation?.country)==='MY')loadArea(p,seq);
-}
-async function ipLocate(){
- try{const p=await requestJSON('/api/location');await useArea({...p,approx:true,label:(p.city||p.region||p.country)+' · '+t('approxLabel')})}
- catch{await useArea({lat:3.139,lon:101.687,approx:true,label:t('defaultArea')})}
-}
-async function locate(){
- if(geoBusy)return;if(!navigator.geolocation){toast(t('geoFail'));return}
- geoBusy=true;$('#location').disabled=true;const generation=locationSequence;
- navigator.geolocation.getCurrentPosition(async p=>{
-  geoBusy=false;$('#location').disabled=false;if(generation!==locationSequence)return;
-  await useArea({lat:p.coords.latitude,lon:p.coords.longitude,country:userLocation?.country,accuracy:p.coords.accuracy,approx:false,label:t('locationAction')});
-  centreMap(userLocation);
- },()=>{geoBusy=false;$('#location').disabled=false;toast(t('geoFail'));if(!userLocation)ipLocate()}, {enableHighAccuracy:true,timeout:12000,maximumAge:60000});
-}
-function renderNearby(){
- const origin=originPoint(),list=stations.filter(s=>Number.isFinite(s.aqi)&&haversine(origin,s)!==null).sort((a,b)=>haversine(origin,a)-haversine(origin,b)).slice(0,30);
- $('#nearby').innerHTML='<div class="panel"><h2>'+esc(t('nearbyT'))+'</h2><p>'+esc(t('nearbyS'))+'</p>'+(!list.length?'<p>'+esc(t('nearbyEmpty'))+'</p>':list.map((s,i)=>'<button class="row" data-station="'+i+'"><span class="badge" style="background:'+color(s.aqi,s.index)+'">'+s.aqi+'</span><span class="row-text"><b>'+esc(s.name)+'</b><small>'+(origin.approx?(haversine(origin,s)<1?'<1 km':'≈ '+Math.round(haversine(origin,s))+' km'):distanceText(haversine(origin,s)))+' · '+esc(indexLabel(s))+' · '+esc(t('lvl'+band(s.aqi,s.index)))+'</small></span>'+icon('arrow')+'</button>').join(''))+'</div>';
- $$('#nearby [data-station]').forEach(b=>b.onclick=()=>selectStation(list[+b.dataset.station]));
-}
-let newsCache=null,newsTime=0,newsLocale='',newsController,newsSeq=0;
-function newsQuery(){const p=new URLSearchParams({locale:settings.locale==='AUTO'?(searchLocation?.country||'AUTO'):settings.locale});if(settings.locale==='AUTO'&&searchLocation?.name)p.set('city',searchLocation.name);return p.toString()}
-async function loadNews(force=false){
- const query=newsQuery();if(!force&&newsCache&&newsLocale===query&&Date.now()-newsTime<900000){renderNews(newsCache);return}
- const seq=++newsSeq;newsController?.abort();newsController=new AbortController();
- if(!newsCache||newsLocale!==query)$('#news').innerHTML='<div class="panel"><h2>'+esc(t('newsT'))+'</h2><div class="skeleton"></div><div class="skeleton"></div></div>';
- try{const items=await requestJSON('/api/news?'+query+(force?'&fresh=1':''),newsController.signal);if(seq!==newsSeq)return;if(!Array.isArray(items))throw Error();newsCache=items;newsTime=Date.now();newsLocale=query;renderNews(items)}
- catch{if(seq===newsSeq)renderNews(newsLocale===query?(newsCache||[]):[],true)}
-}
-function renderNews(items,failed=false){
- $('#news').innerHTML='<div class="panel"><div class="panelhead"><h2>'+esc(t('newsT'))+'</h2><button class="icon-button" id="news-refresh" aria-label="Refresh news">'+icon('refresh')+'</button></div><p>'+esc(t('newsS'))+'</p>'+(failed?'<p class="notice">'+esc(t('newsFailed'))+'</p>':'')+(items.length?items.map(x=>'<a class="story" href="'+safeUrl(x.link)+'" target="_blank" rel="noopener noreferrer"><span>'+esc(x.source)+'</span><b>'+esc(x.title)+'</b><small>'+esc(Number.isFinite(Date.parse(x.published))?dateText(x.published):'')+'</small></a>').join(''):'<p>'+esc(t('nonews'))+'</p>')+'</div>';$('#news-refresh').onclick=()=>loadNews(true);
-}
-function renderTrend(){
- if(current?.index==='my'){$('#trend').innerHTML='<div class="panel"><h2>'+esc(t('forecastTab'))+'</h2><p>'+esc(t('myForecast'))+'</p></div>';return}
- const f=latestForecast(current);
- if(!f.length){$('#trend').innerHTML='<div class="panel"><h2>'+esc(t('trendT'))+'</h2><p>'+esc(t('noForecast'))+'</p></div>';return}
- const max=Math.max(50,...f.map(x=>x.max??x.avg)),w=340,h=155,step=300/f.length,y=v=>125-v/max*100;
- const bars=f.map((x,i)=>{const cx=20+step*(i+.5),min=x.min??x.avg,max=x.max??x.avg;return '<line x1="'+cx+'" x2="'+cx+'" y1="'+y(max)+'" y2="'+y(min)+'" stroke="'+color(x.avg)+'" stroke-width="8" opacity=".3" stroke-linecap="round"/><circle cx="'+cx+'" cy="'+y(x.avg)+'" r="4" fill="'+color(x.avg)+'"/><text x="'+cx+'" y="'+(y(max)-10)+'" text-anchor="middle" font-size="12" fill="'+color(x.avg)+'">'+x.avg+'</text><text x="'+cx+'" y="149" text-anchor="middle" font-size="11" fill="#56665f">'+esc(new Date(x.day+'T12:00:00').toLocaleDateString(lang,{weekday:'short'}))+'</text>'}).join('');
- $('#trend').innerHTML='<div class="panel"><h2>'+esc(t('trendT'))+'</h2><p>'+esc(current.name)+'</p><svg class="chart" viewBox="0 0 '+w+' '+h+'" role="img" aria-label="Daily PM2.5 AQI forecast. Values in the table below.">'+bars+'</svg><p>'+esc(t('forecastNote'))+'</p><div class="forecast-row"><b>Date</b><b>'+esc(t('range'))+'</b><b>'+esc(t('average'))+'</b></div>'+f.map(x=>'<div class="forecast-row"><b>'+esc(new Date(x.day+'T12:00:00').toLocaleDateString(lang,{month:'short',day:'numeric'}))+'</b><span>'+(x.min??'—')+'–'+(x.max??'—')+'</span><b style="color:'+color(x.avg)+'">'+x.avg+'</b></div>').join('')+'<p style="margin-top:16px">'+esc(t('trendSrc'))+'</p></div>';
-}
-function showTab(view){
- scrollPositions[activeView]=$('#card').scrollTop;activeView=view;$('.app').dataset.view=view;
- $$('.tabs button').forEach(b=>{const on=b.dataset.tab===view;b.setAttribute('aria-selected',on);b.tabIndex=on?0:-1});
- ['now','nearby','news','trend'].forEach(id=>$('#'+id).hidden=id!==(view==='map'?'now':view));
- if(view==='nearby')renderNearby();if(view==='news')loadNews();if(view==='trend')renderTrend();
- $('#card').scrollTop=scrollPositions[view]||0;
- if(view==='map'){requestAnimationFrame(()=>{map?.invalidateSize({pan:false});loadViewport()})}
-}
-let focusReturn=null,openOverlay=null;
-function openModal(id){
- focusReturn=document.activeElement;openOverlay=$('#'+id);openOverlay.hidden=false;
- $('.top').inert=true;$('.workspace').inert=true;
- if(id==='modal'){syncSettings();$('#close').focus()}else{$('#sinput').focus()}
-}
-function closeModal(){
- if(!openOverlay)return;openOverlay.hidden=true;openOverlay=null;$('.top').inert=false;$('.workspace').inert=false;focusReturn?.focus();
-}
-document.addEventListener('keydown',e=>{
- if(openOverlay){if(e.key==='Escape'){e.preventDefault();closeModal()}else if(e.key==='Tab'){
- const nodes=[...openOverlay.querySelectorAll('button,input,select,a[href]')].filter(x=>!x.disabled&&x.getClientRects().length);const first=nodes[0],last=nodes[nodes.length-1];
- if(e.shiftKey&&document.activeElement===first){e.preventDefault();last.focus()}else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first.focus()}
- }}
-});
-function syncSettings(){
- $('#index').value=settings.index;
- $('#delta').value=settings.delta;$('#delta-label').textContent=settings.delta+'+';$('#browser-alert').checked=settings.browser;$('#background-alert').checked=settings.background;$('#sensitive').checked=settings.sensitive;$('#locale').value=settings.locale;
- const supported=typeof Notification!=='undefined';$('#browser-alert').disabled=!supported;
- $('#notify-help').textContent=supported?t('foregroundNote'):t('noNotif')+(/iPad|iPhone|iPod/.test(navigator.userAgent)?' '+t('hsHint'):'');
- $('#background-setting').hidden=!backgroundReady;$('#background-alert').disabled=!settings.browser;
-}
-async function saveSettings(){
- const button=$('#save');button.disabled=true;
- try{
-  let enabled=$('#browser-alert').checked;
-  if(enabled){if(typeof Notification==='undefined')enabled=false;else if(Notification.permission==='default')enabled=await Notification.requestPermission()==='granted';else enabled=Notification.permission==='granted';if(!enabled)toast(t('permissionDenied'))}
-  const indexChanged=settings.index!==$('#index').value;
-  const next={delta:+$('#delta').value,browser:enabled,sensitive:$('#sensitive').checked,locale:$('#locale').value,index:$('#index').value,lang,background:!indexChanged&&backgroundReady&&enabled&&$('#background-alert').checked};
-  if(next.background){
-   try{await enablePush(next);next.backgroundStation=stationKey(current)}catch{next.background=false;toast(t('bgFailed'))}
-  }else if(settings.background){await disablePush()}
-  const localeChanged=settings.locale!==next.locale;settings=next;baseline.clear();
-  if(current)checkAlert(current);
-  const persisted=storage.set('airly-settings',settings);closeModal();render();if(indexChanged){const p=originPoint(),mode=searchLocation?'search':'home';await useArea(p,mode)}if(localeChanged&&activeView==='news')loadNews(true);if($('#toast').hidden)toast(t(persisted?'saved':'notSaved'));
- }catch{toast(t('bgFailed'))}finally{button.disabled=false}
-}
-async function enablePush(next){
- if(!serviceRegistration||!current?.uid)throw Error('Select a station first');
- const kj=await requestJSON('/api/push/key');if(!kj.key)throw Error('Unavailable');
- const dec=v=>Uint8Array.from(atob(v.replace(/-/g,'+').replace(/_/g,'/')+'='.repeat((4-v.length%4)%4)),c=>c.charCodeAt(0));
- let sub=await serviceRegistration.pushManager.getSubscription();if(!sub)sub=await serviceRegistration.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:dec(kj.key)});
- const response=await fetch('/api/push/subscribe',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({...sub.toJSON(),uid:current.uid,lat:current.lat,lon:current.lon,delta:next.delta,lang})});
- if(!response.ok)throw Error('Could not save');
-}
-async function disablePush(){
- const sub=await serviceRegistration?.pushManager?.getSubscription();if(!sub)return;
- const r=await fetch('/api/push/unsubscribe',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({endpoint:sub.endpoint})});if(!r.ok)throw Error('Could not remove subscription');await sub.unsubscribe();
-}
-let searchTimer;
-async function runSearch(){
- const q=$('#sinput').value.trim();searchController?.abort();const seq=++searchSequence;
- if(q.length<2){$('#sresults').replaceChildren();return}
- searchController=new AbortController();$('#sresults').textContent=t('fetching')+'…';
- try{const items=await requestJSON('/api/search?q='+encodeURIComponent(q)+'&lang='+lang,searchController.signal);
- if(seq!==searchSequence||$('#sinput').value.trim()!==q)return;
- $('#sresults').innerHTML=items.length?items.map((s,i)=>'<button class="row" data-city="'+i+'"><span class="row-text"><b>'+esc(s.name)+'</b><small>'+esc(s.region)+'</small></span>'+icon('arrow')+'</button>').join(''):'<p>'+esc(t('noResults'))+'</p>';
- $$('#sresults [data-city]').forEach(b=>b.onclick=()=>{const p=items[+b.dataset.city];closeModal();showTab('now');useArea(p,'search')});
- }catch(e){if(seq===searchSequence)$('#sresults').textContent=t('dataError')}
-}
-$('#delta').oninput=e=>$('#delta-label').textContent=e.target.value+'+';
-$('#browser-alert').onchange=e=>{ $('#background-alert').disabled=!e.target.checked;if(!e.target.checked)$('#background-alert').checked=false };
-$('#open-settings').onclick=()=>openModal('modal');$('#close').onclick=closeModal;
-$('#open-search').onclick=()=>openModal('smodal');$('#sclose').onclick=closeModal;
-$$('.overlay').forEach(el=>el.onclick=e=>{if(e.target===el)closeModal()});
-$('#sinput').oninput=()=>{clearTimeout(searchTimer);searchTimer=setTimeout(runSearch,300)};
-$('#save').onclick=saveSettings;$('#refresh').onclick=()=>refresh(true);$('#location').onclick=locate;
-$('#locate').onclick=()=>centreMap();$('#map-reading').onclick=()=>showTab('now');
-$('#lang').onchange=e=>{lang=e.target.value;settings.lang=lang;storage.set('airly-settings',settings);applyI18n();render();if(activeView==='news'&&newsCache)renderNews(newsCache)};
-$$('.tabs button').forEach(b=>{
- b.onclick=()=>showTab(b.dataset.tab);
- b.onkeydown=e=>{if(!['ArrowLeft','ArrowRight','Home','End'].includes(e.key))return;e.preventDefault();const buttons=$$('.tabs button').filter(el=>el.getClientRects().length);const index=buttons.indexOf(b),next=e.key==='Home'?0:e.key==='End'?buttons.length-1:(index+(e.key==='ArrowRight'?1:-1)+buttons.length)%buttons.length;showTab(buttons[next].dataset.tab);buttons[next].focus()};
-});
-document.addEventListener('visibilitychange',()=>{if(document.hidden){clearTimeout(refreshTimer);return}render();if(Date.now()-lastSuccess>300000)refresh();else scheduleRefresh()});
-window.addEventListener('offline',()=>{clearTimeout(refreshTimer);loadError='Offline';render()});
-window.addEventListener('online',()=>refresh());
-matchMedia('(max-width:820px)').addEventListener('change',e=>{if(!e.matches&&activeView==='map')showTab('now');requestAnimationFrame(()=>map?.invalidateSize({pan:false}))});
-// Keep age labels current without replacing the dashboard or interrupting focus.
-setInterval(()=>{
- if(document.hidden||!current||loading)return;
- const live=$('#now .live');if(!live)return;
- const q=quality(current);if(!loadError&&live.dataset.quality!==q){render();return}
- const status=current.detail===false?t('stationLoading'):loadError?t(navigator.onLine===false?'offline':'failed'):t(q==='fresh'?'fresh':q==='stale'?'stale':'unknownTime');
- live.lastElementChild.textContent=status+(current.time?' · '+ageText(current.time):'');
- $('#map-reading-label').textContent=indexLabel(current)+(current.time?' · '+ageText(current.time):'');
-},60000);
-applyI18n();initMap();loading=true;render();
-(async()=>{
- await ipLocate();
- try{const permission=await navigator.permissions?.query({name:'geolocation'});if(permission?.state==='granted'&&requestMode==='home')locate()}catch{}
-})();
-if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js',{updateViaCache:'none'}).then(r=>{serviceRegistration=r}).catch(()=>{});
-requestJSON('/api/config').then(c=>{backgroundReady=!!c.backgroundPush&&'PushManager' in window;syncSettings()}).catch(()=>syncSettings());
-
-</script></body></html>*/}
-const HTML = HTML_SOURCE.toString().slice(HTML_SOURCE.toString().indexOf('/*') + 2, HTML_SOURCE.toString().lastIndexOf('*/'))
-  .replace('<link rel="stylesheet"', [
+const HTML = HTML_SOURCE
+  .replace('__ALERT_TRANSITION__',alertSource)
+  .replace('<title>', [
     '<meta name="description" content="Live air quality worldwide: AQI readings, PM2.5, haze maps, daily forecasts and health advice for your location — Malaysia, Southeast Asia and every region on the World Air Quality Index network.">',
     '<meta name="keywords" content="air quality Malaysia, AQI Malaysia, API Malaysia, jerebu, indeks pencemaran udara, haze Southeast Asia, PM2.5, Kuala Lumpur air quality, Singapore PSI, haze forecast, kualiti udara, 空气质量, காற்றுத் தரம், air quality near me, world AQI map, global air pollution">',
     '<script type="application/ld+json">'+JSON.stringify({'@context':'https://schema.org','@type':'WebApplication',name:'Airly by Ordinexis',url:'__ORIGIN__/',description:'Live worldwide air quality: AQI readings, PM2.5, haze maps, forecasts and health advice, scoped to your location.',applicationCategory:'Weather',operatingSystem:'Any',offers:{'@type':'Offer',price:'0',priceCurrency:'USD'},creator:{'@type':'Organization',name:'Ordinexis',url:'https://www.ordinexis.com'},inLanguage:['en','ms','ta','zh']})+'</'+'script>',
@@ -947,7 +491,7 @@ const HTML = HTML_SOURCE.toString().slice(HTML_SOURCE.toString().indexOf('/*') +
     '<meta name="twitter:title" content="Airly — Global AQI · Live Air Quality Map">',
     '<meta name="twitter:description" content="Live AQI, PM2.5 and haze readings across Southeast Asia.">',
     '<meta name="twitter:image" content="__ORIGIN__/og-image.png">',
-    '<link rel="stylesheet"'
+    '<title>'
   ].join(''));
 
 const LOGO_PNG_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAYAAABccqhmAAAL7klEQVR4nO3dz28cZx3H8e8zO+OYVC3X/gccety0mxQkx6Q9UNEDSe2K9MKth4oD3NF6/wA40UNOXCgS66ZckECCxLIUNTHECA6txIkrVwRJ6t2d58thM43trOP9Mc/M8+P9kqJU/WFPNfN5x7vr9YgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOMa0fQBAIoyIqLjfnDr++AAAIHg8BAAcGQ6Hne3t7fKjn+58dOHC+o+Pjr6aiGpe/2cyKqJGRMRk+fd++fOf/avf72eDwcCe9186OBgAIiJffPFF9Qfsq0Wx9q3xeCRZ1nH6OcuOXFjk3ycAgGMqMhqPx5OytJOytLVtzhgxqmKMEVWdfjVvNVvoSUACADhmRNaKosjH46O8nq8Api8mlLYUsVZERI1Z7uE8AQAcee2116o/jf89Ho/+aa2d2LJcfXPGiKiKiHnVZOabqsu/8kcAAEe2t7dLEZGPf7HzsYh8XNfH7ff7+WAwmHz0k51frV1Y/9FXT56Uxiy35ayugwLQjGNfWawsia8AtraGHRGR3d1pkYEXcXS91PadgE9fXajlJfzoA9DvazYYmPLYX5/72ijS5fB60VO/1/XxVhL1Q4CNjb18MDB28/WDm9cuf/7BYGDsxsZe9NHDclK8XqINQLd7q9jf35xs9u5fz4v1T7LspV9f692/sb+/Oel2HxZtHx/8kur1EmUAut1bxeHhh+PN3v3reXZxaO3YWjuyWfaN4bXe/RuHh5fGMZ9ULCbl6yW6AJw+marjTGViVEqjOjEpnFTML/XrJaoAzDqZVko1khkjmbFSagonFfPheokoAGefTPP1/6MRkx0/qVcjPak4H9fLVBQBmOdkVo6f1CLisuNsXC/PBB+ARU5m5XTZYzupOBvXy0lBB2BjYy9f9GRWYj6pmG2Z8VfOul5C/z6BYAPQ72v29eu2C57MChFIxyrjr5y8Xi4Or/bu3djf35z0+xrsjoI88K2tYWcwMPatyw9v5p2Lu1ZHxspEFjmZFSIQvzrGX5leLxOxOpKi88rw2uWDDwYDY6v3D4QmyAA8U71XY7X3RRCBeNU5/ueF/xO4gwzA7u522e9r9ucHvd+U40fvZabQTHJR1aXfuEEE4uNi/CpqM8klM2s6KR9v3XnQ+6Tf1yzUd5oGGQARkeqNGnf/+ubvJvbxtjGFzUzHEAGIuBx/xxhT2Il9vL13cOWz6g1EdR57k4INgIhI9UaNvYMrnxEBVJoaf/UGojqPvWlBB0BEpBonEYBIs+M/PPxwXOexL8GKaClGS5Hq12KCD4AIEcBUYuMXEX1p7cJ6p8jXLqytrXfW1tY7xiy26SgCIEIEUpfS+L/88ksVETFG/jY6Oro7Ho/+dDQ6uns0OrorE/M/EZGdnZ25XqKI7tZg3e7D4vDw0skLQUs1po4LIVdrn2zfObhyu/o8dR47lpPS+OsWXQBEiEBKUh6/qpqdnZ0TG57nfoDHRRkAESKQgpTHX5dongM4jecE4sb46xFtAESIQKwYf32iDoAIEYgN469X9AEQIQKxYPz1SyIAIkQgdIzfjWQCIEIEQsX43UkqACJEIDSM363kAiBCBELB+N1LMgAiRMB3jL8ZyQZAhAj4ivE3J+kAiBAB3zD+ZiUfABEi4AvG3zwC8BQRaBfjbwcBOIYItIPxt4cAnEIEmsX420UAZiACzWD87SMAZyACbjF+PxCAFyACbjB+fxCAcxCBejF+vxCAORCBejB+/xCAORGB1TB+PxGABRCB5TB+fxGABRGBxTB+vxGAJRCB+TB+/xGAJRGBF2P8YSAAKyACszH+cBCAFRGBkxh/WAhADYjAFOMPDwGoSeoRYPxhIgA1SjUCjD9cBKBmqUWA8YeNADiQSgQYf/gIgCOxR4Dxx4EAOBRrBBh/PAiAY7FFgPHHhQA0IJYIMP74EICGhB4Bxh8nAtCgUCPA+ONFABoWWgQYf9wIQAtCiQDjjx8BaInvEWD8aSAALfI1Aow/HQSgZb5FgPGnhQB4wJcIMP70EABPtB0Bxp8mAuCRtiLA+NNl2j4APK/bfVgcHl46OUgt1Zg6BpmrtU+27xxcud3t3ipERBh/ugiAp1xHoCwfvX/3L9/+VETkau/ejSJ7+beMPz0EwGNOI5CtqZZH71pR7XTWf692ZBh/egiA59xEwGpmCmNtWYqIZFmnY3WsRrKlrwfGHyYCEAAXERBRla8Hb1XEMP4EEYBAuIuACONPFwEIiJsILI/xh4/vAwiIi+8TWBbjjwMBCIwPEWD88SAAAWozAow/LgQgUG1EgPHHhycBAzfziUGZyCqv6c+iYjWTXBh/XAhABE5EoHPxU9WJUZ2s9Nr+SarG5MaYXGz53/fuHHznNuOPAw8BIjB9OHCr2Du48pm1X70jkj8S6eiz1/lXoTr9WPmjsnz8DuOPCwGIjKp19lWd8hVjdDihEaj+RL7Wu3cj67z8qepE3D0EePze9K3E04cd9Xx8tIUABG72D/Nw+STg8Z8nQARCx0OAgJ39k3zqHb+IiJHMtH1XYtSPAATKxY/xOo8PtyZHvQhAgNoYf4UIxIUABKbN8VeIQDwIQEB8GH+FCMSBAATCzfh1pW8WIgLhIwABcDf+zEx/EYFUEQDPublph1VjCqNqS1VbGlMYFUsEEkQAPObujj25GFOUIuZdY+T7xuRlJrm0fVdiNI8AeMr17brG5X/ev3vwxh/uPOj9cVI+av2uxGgH3wrsoSbv1Scy49ZgTm5DxrcN+4gAeKaNG3U2dy9CIuAbHgJ4pK279LZ9a3K0hwB4ou1bdBOBNBEAD7Q9/goRSA8BaJkv468QgbQQgBb5Nv4KEUgHAWiJr+OvEIE0EIAW+D7+ChGIHwFoWCjjrxCBuBGABoU2/goRiBcBaEio468QgTgRgAaEPv4KEYgPAXAslvFXiEBcCIBDsY2/QgTiQQAciXX8FSIQBwLgQOzjrxCB8BGAmqUy/goRCBsBqFFq468QgXARgJqkOv4KEQgTAahB6uOvEIHwEIAVMf6TiEBYCMAKGP9sRCAcBGBJjP/FiEAYCMASGP98iID/CMCCGP9iiIDfCMACGP9yiIC/CMCcGP9qiICfCMAcGH89iIB/CMA5GH+9iIBfCMALMH43iIA/CMAZGL9bRMAPBGAGxt8MItA+AnAK428WEWgXATiG8beDCLSHADzF+NtFBNpBAITx+4IINC/5ADB+vxCBZiUdAMbvJyLQnGQDwPj9RgSakWQAGH8YiIB7yQWA8YeFCLiVVAAYf5iIgDvJBIDxh40IuJFEABh/HIhA/aIPAOOPCxGoV9QBYPxxIgL1iTYAjD9uRKAeUQaA8aeBCKwuugAw/rQQgdVEFQDGnyYisLxoAsD409ZEBK5GGAHT9gHUgfGj0u0+LA4PL528FrRUY+q4FnK19sn2nYMrt6vPU+extyH4rwAYP47j4cBigg7AxsZezvhxWpMR2NjYy+s89qYFG4B+X7P9/c0J48cs7iNwcXi1d+/G/v7mpN/XYHcU5IFvbQ07g4Gxb11+eDPvXNy1OjJWJsL4cZy7CEzE6kiKzivDa5cPPhgMjN3aGnbqPPamBBmAZ8qnv6/2XCbjj5eLCDyjq3+IlgX7KkC/r9lgYOx3X//8B538pd1ln+1l/Gmo69WBWddLdS26OnaXgg2AyPRJwOeeB1jgpDL+tKwagVnXS3UNuj52V4IOgMjyJ5Xxp4nr5aTAnwNY7jFerCcT5+N6OSn4AIgsdlJjPpmYD9fLM1EEQGS+kxr7ycT8uF6mgn8O4LSZj/Fk+hxNJrnEfDKxuNSvl+gCIPL8SbU6NiIqmVnTmE8mlsP1EqHqjRqbvfvX337z7/r2m//Qzd7969N/div4N3GgXlwvEareqLH5xoMfbr7++c3jfw84jeslQsffqBHymzbQDK6XCG1tDTuhvlkDzeN6AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAL0f0wS2b08MMSXAAAAAElFTkSuQmCC';

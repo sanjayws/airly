@@ -1,91 +1,92 @@
 # Airly
 
-A single-file Cloudflare Worker that serves a complete, worldwide air-quality web app: live AQI readings from the nearest monitoring station, an interactive station map, AI-generated health advisories, daily PM2.5 trend & forecast, local air-quality news, and background push alerts — in English, Bahasa Melayu, Tamil, and Mandarin.
+[Open the live app](https://airly.sanjay6326.workers.dev) · [Accuracy investigation](ACCURACY_AUDIT.md) · [Audit fixes](AUDIT_FIXES.md)
 
-Everything — backend API, frontend, icons, service worker, web manifest — lives in one `worker.js`. No build step, no dependencies, no database required for the core app.
+Air quality near you, served by a Cloudflare Worker. Official Malaysia API readings come from the Department of Environment (DOE/APIMS); worldwide US AQI displays are derived from the World Air Quality Index Project (WAQI) pollutant sub-indices. Forecasts are WAQI model predictions.
 
-## Features
+The core app needs no database or frontend framework. The deployment entry point is `worker.js`; dashboard source lives in `ui/app.js`, shared alert and country logic in `lib/`, and committed vendor assets in `data/`. Wrangler emits a single `dist/worker.js` bundle. English, Bahasa Melayu, Tamil, and Mandarin are supported.
 
-- **Live readings** from the [World Air Quality Index Project](https://waqi.info) (WAQI) — AQI, PM2.5, PM10, humidity, wind, temperature, and station-update time for the monitor nearest the user, anywhere in the world.
-- **Interactive map** (Leaflet + OpenStreetMap) with severity-colored station bubbles scoped to the user's region, a pulsing user-location marker, and smooth zoom.
-- **AI health advisories** via Cloudflare Workers AI, strictly grounded in the official US EPA AQI bands with server-side output guards against unsafe or over-alarming advice. Falls back to static EPA-based advice on any failure. Free-tier friendly (aggressively cached).
-- **Trend & Forecast tab** — daily PM2.5 min/avg/max outlook per station (WAQI forecast data).
-- **News tab** — recent air-quality coverage for the user's country (auto-detected), region, and the world.
-- **Background push alerts** (optional) — full Web Push (VAPID + RFC 8291 encryption) implemented in pure WebCrypto; a cron checks each subscriber's location and notifies on meaningful AQI changes, even with the site closed.
-- **US AQI ⇄ Malaysia API** unit toggle, applied across the whole UI.
-- **4-language UI** with full string parity; installable PWA (manifest + service worker), mobile bottom-sheet layout, OpenGraph/Twitter cards, JSON-LD.
+## Location behavior
 
-## Deploy — minimal (5 minutes)
+- Airly requests a fresh device position first. Allow the browser's location permission for the nearest station to your device coordinates.
+- **Use my location** requests a fresh position with high accuracy enabled and no cached positions. Device accuracy is shown beside the location. Accuracy ultimately depends on the browser and device.
+- **Refresh** in your own area reacquires device location and finds the nearby station again. In a searched city it refreshes that city; after explicitly selecting a station it refreshes that station.
+- When location is blocked, unavailable, or times out, Airly displays an explanation and an approximate IP area. IP location can resolve to another state because of a mobile carrier, ISP, or VPN. It is never labeled as a precise device position.
+- **Choose a city** or the search button lets you select a city instead. City selection lasts only for the current visit. Opening, reloading, or returning to Airly requests the device location again and discards any previous city or station selection. Language, index preference, alerts and other settings stay saved. GPS coordinates and city selections are not saved in local storage.
+- If both device and IP location fail, the Kuala Lumpur default is clearly labeled. A broad device accuracy estimate also displays a warning.
+- Stations measure air at their own locations. The dashboard names the station and shows its distance from the device, approximate area, or selected city.
 
-Prerequisites: a Cloudflare account and [wrangler](https://developers.cloudflare.com/workers/wrangler/) (`npm i -g wrangler`), plus a free WAQI API token from https://aqicn.org/data-platform/token/.
+For a Selangor device incorrectly assigned a Penang IP address, device coordinates take priority. If device location is unavailable, search for your city, such as **Shah Alam**, **Petaling Jaya**, **Klang**, or **Kajang**.
+
+## Dashboard
+
+The reading and health guidance appear beside an interactive station map on desktop. Mobile has dedicated Air, Map, Nearby, News, and Forecast views. Current readings, stale readings, measurement times, index scales, source attribution, and pollutant sub-indices are labeled explicitly.
+
+Malaysia API is the official DOE value, not a numerical conversion from US AQI. Automatic mode resolves the provider from coordinates using offline country boundaries, so VPN/ISP metadata cannot override GPS. Explicit Malaysia API selection returns a no-coverage error when no nearby DOE station is available. A distant Malaysian station is not substituted for a device position outside the supported area. You can select the provider in Settings.
+
+DOE does not provide a forecast in this feed; Airly explains that instead of substituting a US AQI forecast. For WAQI stations, forecasts show upcoming daily PM2.5 AQI sub-indices, not measured concentrations. Health guidance is deterministic. The former AI advice endpoint is retired and returns HTTP 410 without invoking upstream services or Workers AI.
+
+WAQI's headline `aqi` can contain a national index: it must not be assumed to be US AQI. Airly takes the maximum available pollutant AQI sub-index and labels its provider. Missing or contradictory incomplete data fails closed. Maps fetch detail for up to 12 nearby stations; other pins remain neutral and selectable. The app does not convert Malaysia API into US AQI, reconstruct raw concentrations, or claim to independently reproduce the current EPA NowCast. See [the accuracy investigation](ACCURACY_AUDIT.md) for evidence, tests and provider limitations.
+
+## Develop and deploy
+
+Use Node.js 22 or later and a Cloudflare account. Obtain a free [WAQI API token](https://aqicn.org/data-platform/token/). For your own deployment, update `name` and `account_id` in `wrangler.toml` to your Worker name and Cloudflare account before setting secrets or deploying.
 
 ```sh
 git clone https://github.com/sanjayws/airly
 cd airly
-wrangler secret put AQICN_TOKEN      # paste your WAQI token when prompted
-wrangler deploy
+npm ci
+npm run verify
+npx wrangler login
+npx wrangler secret put AQICN_TOKEN
+npm run deploy
 ```
 
-That's it — the app is fully functional at your `*.workers.dev` URL: map, readings, trend, news, static health advice. The two optional features below each need a little more setup.
+`npm run build` performs a deployment dry run and compares the bundled app HTML to the source app. HTML is stored as a template string so normal Wrangler bundling preserves it. The build bundles the dashboard and fixed Leaflet assets with the backend. The canonical deployment directory is the Git checkout; `npm run sync:root` optionally copies the verified bundle and config to its parent workspace. Edit source in the checkout, never the generated root copy. `npm run dev` starts Wrangler locally; IP geolocation may not be available in local development.
 
-## Optional: AI advisories
+When updating an existing deployment, retain its account, bindings, secrets, and triggers. `npm run deploy` uses `--keep-vars`. Malaysia DOE readings do not require the WAQI token, but worldwide stations do. Never put secret values in source control.
 
-Add the Workers AI binding to `wrangler.toml` (already present in the template) and redeploy:
+## Guidance and news
 
-```toml
-[ai]
-binding = "AI"
-```
+`/api/advice` is retired and no AI binding is deployed. GPS news uses country-wide coverage when the device locality is unknown; it does not guess a city from the IP address. Selected cities get city-specific coverage. Search and news return explicit upstream errors, and partial news results carry a degraded-source header.
 
-Advisories are generated by `@cf/qwen/qwen3-30b-a3b-fp8` (fallback `@cf/meta/llama-3.2-3b-instruct`) and cached 15 minutes per ~1 km location bucket + language + health profile + AQI band, so a busy city costs a handful of inferences per hour. On the Workers **Free** plan, exhausting the daily free AI allocation makes calls throw — the app silently falls back to static advice and can never incur charges.
+## Optional background push alerts
 
-## Optional: background push alerts
+1. Generate VAPID keys with `npx web-push generate-vapid-keys`.
+2. Set `VAPID_PUBLIC_KEY` and `VAPID_PRIVATE_KEY` with `wrangler secret put`. Optionally set `VAPID_SUBJECT` to a contact URI.
+3. Create storage with `wrangler kv namespace create PUSH_SUBS` and uncomment the matching KV binding in `wrangler.toml` using its namespace ID.
+4. Keep the cron trigger `0,30 * * * *` and deploy.
 
-1. Generate VAPID keys: `npx web-push generate-vapid-keys`
-2. Set secrets:
-   ```sh
-   wrangler secret put VAPID_PUBLIC_KEY
-   wrangler secret put VAPID_PRIVATE_KEY
-   wrangler secret put VAPID_SUBJECT        # e.g. mailto:you@example.com (optional)
-   ```
-3. Create the KV namespace and paste the printed block into `wrangler.toml`:
-   ```sh
-   wrangler kv namespace create PUSH_SUBS
-   ```
-4. Ensure the cron trigger is in `wrangler.toml` (template includes it):
-   ```toml
-   [triggers]
-   crons = ["0,30 * * * *"]
-   ```
-5. `wrangler deploy`
+Users opt in under Settings. Background alerts store the subscription and station on the server. Without push setup, browser alerts check for changes while the app is open. On supported iOS versions, install the app on the Home Screen to use Web Push. Alerts compare dated readings from the same station and scale; stale readings do not trigger alerts. Every fresh measurement advances the last-seen timestamp while the notification baseline remains until a threshold crossing, so gradual changes still trigger alerts. Scheduled checks paginate KV with four concurrent checks, a three-minute processing budget, and a persisted continuation cursor.
 
-Users enable alerts in **Settings → Browser notifications**. Works on desktop browsers and Android; on iOS (16.4+) Apple requires the app to be **added to the Home Screen** first — the UI explains this to affected users automatically.
+Subscriptions expire after 30 days, and active consenting clients renew at most once a day. Records with malformed keys or expired consent are deleted. Opt-out waits for service-worker readiness and confirmed server removal. Registration uses per-network limits of 10 requests/minute and a shared budget of 100/minute per Cloudflare location. These are abuse controls, not a strict globally consistent billing quota; shared mobile networks may hit the per-network limit. Server-side subscription registration refuses to run without both rate-limit bindings.
 
-Dashboard-only deployment (no wrangler) works too: bind KV under **Settings → Bindings**, add secrets under **Variables and Secrets**, and the cron under **Settings → Triggers**.
+## Configuration
 
-## Configuration reference
+| Name | Type | Purpose |
+|---|---|---|
+| `AQICN_TOKEN` | Secret | Worldwide WAQI readings, map, and forecasts |
+| `PUSH_LIMIT`, `PUSH_BUDGET` | Rate-limit bindings | Subscription registration controls |
+| `PUSH_SUBS` | Optional KV binding | Push subscriptions |
+| `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY` | Optional secrets | Web Push authentication |
+| `VAPID_SUBJECT` | Optional secret | Push contact URI |
+| Cron trigger | Optional | Background change checks |
 
-| Name | Type | Required | Purpose |
-|---|---|---|---|
-| `AQICN_TOKEN` | secret | **yes** | WAQI data access |
-| `AI` | Workers AI binding | no | AI advisories (else static advice) |
-| `PUSH_SUBS` | KV binding | no | Push subscription storage |
-| `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` | secrets | no | Web Push auth |
-| `VAPID_SUBJECT` | secret | no | Push contact URI |
-| cron `0,30 * * * *` | trigger | no | Push change detection |
+## Checks
 
-## Notes & caveats
+`npm run verify` runs syntax checks, Node regression tests, and the Wrangler dry run/bundle comparison. `npm run deploy` runs these checks automatically before publishing. `npm run verify:full` additionally runs the Worker-runtime and Chromium suites; CI runs this full set after `npm ci` and installing Chromium.
 
-- **Do not minify** `worker.js` — the frontend HTML lives inside a function comment (`HTML_SOURCE`). Deploy the file as-is.
-- **Attribution**: readings and forecasts are © the World Air Quality Index Project and originating agencies; map tiles © OpenStreetMap contributors. Keep the in-app attribution footer. Review [WAQI's terms](https://aqicn.org/api/) for your use case.
-- **Rate limiting** is not built in; if you expect abuse, add Cloudflare rate-limiting rules for `/api/*` in the dashboard.
-- Cache-bust levers when you change generation logic: bump the `advice/v6` / `news/v4` segments in the cache keys.
-- News is scraped from Bing News RSS best-effort; it degrades to an empty list gracefully.
-- The health advice is informational, not medical advice.
+The regression tests cover the reproduced API/AQI mismatch, pollutant sub-index aggregation, missing data, Malaysia/US category boundaries, timestamps, forecast ranges, GPS/IP country mismatches, manual-provider coverage, invalid inputs, gradual alert thresholds, delayed location responses, map/area ordering, Nearby refresh, news locality and outages, subscription validation, streamed body limits, KV pagination, and expiry. Browser tests exercise the actual page and narrow-screen controls. Runtime tests use Miniflare and local KV.
 
-## Architecture (30 seconds)
+The restricted Codex sandbox used for the audit fixes blocks Chromium sockets and local listeners, so those two suites could not execute there. Node regressions and the deployment bundle can run there; full runtime/browser verification requires a normal development or CI environment. Physical GPS accuracy and real push delivery still depend on the user's device and optional push configuration.
 
-`worker.js` routes: `/` (app HTML), `/api/air` (nearest-station or area stations, proxied + edge-cached WAQI), `/api/advice` (Workers AI, EPA-grounded, guarded), `/api/news`, `/api/location` (Cloudflare geo), `/api/push/*` (subscribe/unsubscribe/key), `/vendor/*` (Leaflet passthrough), plus icons, manifest, and `/sw.js`. A `scheduled()` handler drives push checks. The WAQI token never reaches the client; all upstream calls are timeout-guarded and edge-cached.
+## Architecture
+
+`/` serves the app. `/api/air` retrieves a station or area readings, `/api/location` resolves coordinates to a country, or returns clearly approximate Cloudflare IP metadata when no coordinates are supplied; both use `no-store`, `/api/search` geocodes cities, `/api/news` retrieves regional coverage, `/api/advice` returns a retirement response, and `/api/push/*` manages opt-in notifications. `/vendor/*` serves the packaged Leaflet 1.9.4 assets without contacting a CDN. `scheduled()` checks push subscriptions.
+
+Upstream calls have timeouts. Public DOE data can be edge-cached; pending I/O is scoped to each request. The WAQI token stays on the server. Security headers restrict page capabilities, framing, and external resource access. Worker logs and sampled traces are enabled; upstream and scheduled failures log sanitized route/error codes. Generalized country boundaries include a nearest-coast fallback within 2 km for reclaimed land; unknown offshore positions stay unresolved. See [THIRD_PARTY.md](THIRD_PARTY.md) for data attribution and the Leaflet license.
+
+Preserve in-app [DOE/APIMS](https://eqms.doe.gov.my/APIMS/main), [WAQI](https://aqicn.org/api/), and [OpenStreetMap](https://www.openstreetmap.org/copyright) attribution and observe their terms. Configure Cloudflare rate limiting if needed. News is best-effort. Health guidance is informational.
 
 ## License
 
