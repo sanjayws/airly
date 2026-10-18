@@ -46,6 +46,8 @@ button:not(:disabled):active,.row:active,.story:active{transform:scale(.97);tran
 .modal{border-radius:26px;box-shadow:0 30px 90px #10261c40}.setting{padding:16px 0}
 .setting input[type=checkbox]{appearance:none;-webkit-appearance:none;width:50px;height:30px;border-radius:99px;background:#c9d3c6;position:relative;transition:background .2s;cursor:pointer}.setting input[type=checkbox]:after{content:'';position:absolute;top:3px;left:3px;width:24px;height:24px;border-radius:50%;background:#fff;box-shadow:0 1px 3px #0003;transition:transform .2s}.setting input[type=checkbox]:checked{background:var(--green)}.setting input[type=checkbox]:checked:after{transform:translateX(20px)}
 .map-bubble{border-radius:16px;height:40px;min-width:46px;font-size:13px}
+/* Secondary facts: compact so the reading and guidance stay the focus */
+.metrics{gap:6px;margin:0 0 12px}.metric{padding:8px 12px;border-radius:12px;box-shadow:none;border:1px solid var(--line);display:flex;align-items:baseline;flex-wrap:wrap;gap:0 6px}.metric span{font-size:11px}.metric b{font-size:13px;margin:0;letter-spacing:0;font-weight:650}.metric small{font-size:10px}
 @media(min-width:821px){.card{box-shadow:var(--shadow)}.workspace{gap:24px}.tabs button[aria-selected=true]{box-shadow:var(--shadow)}}
 @media(max-width:820px){
  body{background:var(--paper)}
