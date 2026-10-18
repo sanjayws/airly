@@ -34,3 +34,27 @@ test('app serves location controls, security headers, and valid embedded JS',asy
  assert.match(h,/id="use-location"/);assert.match(h,/id="location-notice"/);assert.match(h,/maximumAge:0/);assert.match(r.headers.get('permissions-policy'),/geolocation=\(self\)/);assert.match(r.headers.get('content-security-policy'),/frame-ancestors 'none'/);
  for(const m of h.matchAll(/<script>([\s\S]*?)<\/script>/g))new Function(m[1]);
 });
+test('a stalled nearby DOE station does not outrank a recently reporting one',async()=>{
+ const fresh=(id,name,lat,lon,time)=>({attributes:{STATION_ID:id,STATION_LOCATION:name,LATITUDE:lat,LONGITUDE:lon,API:60,DATETIME:time,PARAM_SELECTED:'PM2.5'}});
+ const original=globalThis.fetch;
+ globalThis.fetch=async()=>Response.json({features:[fresh('NEAR','Stalled',3.0738,101.5183,Date.now()-3*86400000+8*3600000),fresh('FAR','Working',3.2,101.7,Date.now()+8*3600000-600000)]});
+ try{const p=await (await worker.fetch(request('/api/air?lat=3.0738&lon=101.5183&index=my'),{},{})).json();assert.equal(p.uid,'my:FAR')}
+ finally{globalThis.fetch=original}
+});
+test('worldwide lookup skips a silent nearest WAQI station for a fresh one nearby',async()=>{
+ const original=globalThis.fetch,detail=(idx,lat,time)=>({status:'ok',data:{idx,aqi:50,iaqi:{pm25:{v:50}},city:{name:'S'+idx,geo:[lat,101]},time:{iso:new Date(time).toISOString()}}});
+ globalThis.fetch=async url=>{url=String(url);
+  if(url.includes('map/bounds'))return Response.json({status:'ok',data:[{uid:1,lat:1.01,lon:101},{uid:2,lat:1.1,lon:101},{uid:3,lat:4,lon:101}]});
+  if(url.includes('/@1/'))return Response.json(detail(1,1.01,Date.now()-86400000));
+  if(url.includes('/@2/'))return Response.json(detail(2,1.1,Date.now()-600000));
+  return Response.json({status:'error'})};
+ try{
+  const r=await worker.fetch(request('/api/air?lat=1&lon=101&index=us'),{AQICN_TOKEN:'t'},{});assert.equal((await r.json()).uid,2);
+ }finally{globalThis.fetch=original}
+});
+test('stations beyond the coverage radius are refused',async()=>{
+ const original=globalThis.fetch;
+ globalThis.fetch=async url=>String(url).includes('map/bounds')?Response.json({status:'ok',data:[]}):Response.json({status:'ok',data:{idx:9,aqi:50,iaqi:{pm25:{v:50}},city:{name:'Far',geo:[3,101]},time:{iso:new Date().toISOString()}}});
+ try{const r=await worker.fetch(request('/api/air?lat=1&lon=101&index=us'),{AQICN_TOKEN:'t'},{});assert.equal(r.status,422)}
+ finally{globalThis.fetch=original}
+});

@@ -1,6 +1,6 @@
 // Dashboard source; Wrangler emits it in the worker.js bundle.
 export const HTML_SOURCE = `<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#fffefa"><title>Airly by Ordinexis — Air quality near you</title><link rel="preload" as="style" href="/vendor/leaflet.css" onload="this.rel='stylesheet'">
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#fffefa"><meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-title" content="Airly"><meta name="apple-mobile-web-app-status-bar-style" content="default"><link rel="apple-touch-icon" href="/icon-180.png"><title>Airly by Ordinexis — Air quality near you</title><link rel="preload" as="style" href="/vendor/leaflet.css" onload="this.rel='stylesheet'">
 <style>
 :root{--ink:#173e33;--muted:#65756e;--paper:#fffefa;--base:#edf1ea;--line:#dce5db;--green:#28664e;--soft:#e8f0e5;--nav:76px;color-scheme:light}
 *{box-sizing:border-box}html,body{margin:0;height:100%;overflow:hidden}body{font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;color:var(--ink);background:var(--base);-webkit-text-size-adjust:100%}button,input,select{font:inherit}button,a,input,select{-webkit-tap-highlight-color:transparent}button{cursor:pointer;touch-action:manipulation;color:inherit}button:disabled{cursor:default;opacity:.55}button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible{outline:3px solid #257bc2;outline-offset:3px}a{color:var(--green);text-underline-offset:3px}svg{width:21px;height:21px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}.hidden,[hidden]{display:none!important}
@@ -19,6 +19,56 @@ export const HTML_SOURCE = `<!doctype html>
 @media(max-height:520px) and (max-width:820px){.top{padding-block:7px;gap:4px}.locationbar{padding-top:4px}.location-notice{padding-block:6px}.map-title{display:none}}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;scroll-behavior:auto!important;transition:none!important}}
 
+
+/* ---- App-style refresh: colour-led hero, floating nav, touch feedback ---- */
+:root{--shadow:0 1px 2px #17302410,0 8px 24px #17302410;--radius:22px}
+body{overscroll-behavior:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none}.card,.modal,.sinput,.story,.reading-details{-webkit-user-select:text;user-select:text}
+button:not(:disabled):active,.row:active,.story:active{transform:scale(.97);transition:transform .08s}
+.reading-hero{position:relative;margin:0 0 20px;padding:22px 22px 0;border:0;border-radius:var(--radius);background:radial-gradient(120% 90% at 100% 0%,color-mix(in srgb,var(--reading-color,#28664e) 22%,transparent),transparent 62%),linear-gradient(180deg,color-mix(in srgb,var(--reading-color,#28664e) 8%,var(--paper)),var(--paper));box-shadow:var(--shadow),inset 0 0 0 1px color-mix(in srgb,var(--reading-color,#28664e) 20%,var(--line))}
+.live{width:max-content;max-width:100%;margin:0 0 18px;padding:5px 11px 5px 9px;border-radius:99px;background:#ffffffb3;font-weight:600;font-size:11px}
+.eyebrow{letter-spacing:.1em}.station-name{font-size:25px;letter-spacing:-.8px}
+.distance{display:inline-flex;align-items:center;margin:10px 0 0;padding:4px 10px;border-radius:99px;background:#17302412;font-weight:600;color:var(--ink)}
+.score{margin:14px 0 22px;align-items:flex-end}.score strong{font-size:112px;letter-spacing:-7px;font-weight:700}.score span{padding-bottom:16px}
+.score span{display:flex;flex-direction:column;align-items:flex-start;gap:2px;min-width:0}.score b{display:block;padding:5px 13px;margin-bottom:8px;border-radius:99px;background:color-mix(in srgb,var(--reading-color,#28664e) 16%,#fff);color:var(--ink);font-size:15px;font-weight:700;max-width:none}
+.aqi-scale{margin:0 -22px;gap:2px}.aqi-scale i{height:10px;opacity:.28}.aqi-scale i.active{height:10px;margin-top:0;opacity:1;box-shadow:0 -3px 10px color-mix(in srgb,currentColor 30%,transparent)}
+.notice{border-radius:14px;font-size:12px;line-height:1.5}
+.advice{border:0!important;background:color-mix(in srgb,var(--reading-color,#28664e) 8%,var(--paper));border-radius:16px;padding:16px 18px;margin:0 0 18px;box-shadow:inset 4px 0 0 var(--reading-color,var(--green))}
+.advice h2{font-size:17px}.advice p{font-size:14px;color:#44574d}
+.metric{background:var(--paper);border-radius:16px;box-shadow:var(--shadow);border-color:transparent;padding:14px}.metric b{font-size:26px}
+.reading-details{background:var(--base);border-radius:16px;padding:0 16px;margin:16px 0}.reading-details[open]{padding-bottom:6px}
+.pollutants span{background:var(--paper);border-radius:10px}
+.panel h2{font-size:28px;font-weight:700}
+.row{padding:12px 14px;margin:0 0 10px;width:100%;border:0;border-radius:18px;background:var(--paper);box-shadow:var(--shadow);min-height:76px}.row:hover{background:var(--paper)}.row b{font-size:15px}.row small{line-height:1.5}
+.row .badge,.badge{min-width:52px;height:52px;border-radius:16px;font-size:17px}
+.story{background:var(--paper);box-shadow:var(--shadow);border:0;border-radius:18px;padding:16px 18px;margin:0 0 10px}
+.primary{border-radius:14px}.secondary{border-radius:14px}
+.location-notice{border-radius:16px;background:#fff8e6;border-color:#ecd9a2;color:#5e4a22;box-shadow:var(--shadow)}
+.modal{border-radius:26px;box-shadow:0 30px 90px #10261c40}.setting{padding:16px 0}
+.setting input[type=checkbox]{appearance:none;-webkit-appearance:none;width:50px;height:30px;border-radius:99px;background:#c9d3c6;position:relative;transition:background .2s;cursor:pointer}.setting input[type=checkbox]:after{content:'';position:absolute;top:3px;left:3px;width:24px;height:24px;border-radius:50%;background:#fff;box-shadow:0 1px 3px #0003;transition:transform .2s}.setting input[type=checkbox]:checked{background:var(--green)}.setting input[type=checkbox]:checked:after{transform:translateX(20px)}
+.map-bubble{border-radius:16px;height:40px;min-width:46px;font-size:13px}
+@media(min-width:821px){.card{box-shadow:var(--shadow)}.workspace{gap:24px}.tabs button[aria-selected=true]{box-shadow:var(--shadow)}}
+@media(max-width:820px){
+ body{background:var(--paper)}
+ .top{position:relative;padding-top:max(10px,env(safe-area-inset-top));padding-bottom:8px;gap:6px 8px;border-bottom:0;background:var(--paper)}
+ .brand{font-size:24px;letter-spacing:-1px}.brand small{display:none}.brand img{width:28px;height:28px}
+ .actions .icon-button{width:42px;height:42px;border-radius:50%;background:var(--base)}.actions{gap:6px}.actions select{height:42px;border-radius:21px;background:var(--base);font-weight:650}
+ .locationbar{border-top:0;padding:6px 6px 6px 6px;background:var(--base);border-radius:999px;gap:6px}
+ .locationbar .place{padding:0 4px 0 2px}.place>span:first-child{width:38px;height:38px;background:var(--paper);box-shadow:0 1px 3px #17302418}.place-copy b{font-size:14px}.place-copy small{font-size:11px}
+ .connection{display:none}.locationbar .refresh{width:42px;height:42px;background:var(--paper);border-radius:50%;box-shadow:0 1px 3px #17302418}
+ .location-notice{margin:6px 16px 0;border:1px solid #ecd9a2;border-radius:16px;padding:12px 14px}
+ .card{background:var(--paper);padding:10px max(16px,env(safe-area-inset-right)) 28px max(16px,env(safe-area-inset-left))}
+ .reading-hero{padding:18px 20px 0}.aqi-scale{margin:0 -20px}.score strong{font-size:116px}
+ .tabs{left:12px;right:12px;bottom:max(10px,env(safe-area-inset-bottom));width:auto;height:68px;padding:6px;border:1px solid #17302414;border-radius:24px;background:#fffefae6;backdrop-filter:blur(18px) saturate(1.6);-webkit-backdrop-filter:blur(18px) saturate(1.6);box-shadow:0 10px 32px #17302428}
+ .tabs button{min-height:54px;border-radius:18px;font-size:10px;font-weight:600}.tabs button[aria-selected=true]{background:var(--ink);color:#fff}.tabs button[aria-selected=true] svg{stroke:#fff}
+ .card{inset:0 0 0 0;padding-bottom:calc(var(--nav) + 28px + env(safe-area-inset-bottom))}.map-wrap{inset:0}
+ .map-title{display:none}.map-controls{top:12px;right:12px}.map-controls button{width:46px;height:46px;border-radius:50%}
+ .map-hint{bottom:calc(var(--nav) + 100px + env(safe-area-inset-bottom));left:12px}
+ .mobile-map-card{left:12px;right:12px;bottom:calc(var(--nav) + 18px + env(safe-area-inset-bottom));border-radius:20px;box-shadow:0 8px 28px #17302430;border:0}
+ .leaflet-control-zoom{display:none}.leaflet-bottom.leaflet-right{margin-bottom:calc(var(--nav) + 4px)}
+ .toast{bottom:calc(var(--nav) + 24px + env(safe-area-inset-bottom))}
+ .modal{border-radius:28px 28px 0 0}.modal:before{content:'';display:block;width:40px;height:5px;border-radius:3px;background:#c9d3c6;margin:-14px auto 16px}
+}
+@media(max-width:380px){.score strong{font-size:96px}.tabs button{font-size:9px}}
 </style>
 </head><body><main class="app" data-view="now">
 <header class="top">
@@ -364,15 +414,21 @@ function locate(){
    render();resolve();
   };
   if(!navigator.geolocation){failure({code:2});return}
-  navigator.geolocation.getCurrentPosition(async position=>{
+  const accept=async position=>{
    geoBusy=false;if(intent!==locationIntent){render();resolve();return}
-   const p={lat:position.coords.latitude,lon:position.coords.longitude,accuracy:position.coords.accuracy,source:'gps',approx:position.coords.accuracy>10000,label:t('deviceLocation')};
+   const p={lat:position.coords.latitude,lon:position.coords.longitude,accuracy:position.coords.accuracy,source:'gps',approx:!(position.coords.accuracy<=5000),label:t('deviceLocation')};
    if(!validPoint(p)){await failure({code:2});return}
    locationError='';storage.set('airly-city',null);
    try{const resolved=await requestJSON('/api/location?lat='+p.lat+'&lon='+p.lon);p.country=resolved.country||''}catch{p.country=''}
    if(intent!==locationIntent){resolve();return}
    await useArea(p);if(requestMode==='home')centreMap(userLocation);resolve();
-  },failure,{enableHighAccuracy:true,timeout:20000,maximumAge:0});
+  };
+  // Order of trust: precise device fix, then the browser's coarse (network) fix,
+  // then IP (handled by failure). A denied permission skips straight to the fallback.
+  navigator.geolocation.getCurrentPosition(accept,error=>{
+   if(error?.code===1||intent!==locationIntent){failure(error);return}
+   navigator.geolocation.getCurrentPosition(accept,failure,{enableHighAccuracy:false,timeout:10000,maximumAge:300000});
+  },{enableHighAccuracy:true,timeout:12000,maximumAge:0});
  });
 }
 let locationStarting=false;

@@ -71,5 +71,14 @@ test('duplicate resume events share a pending device request and cannot erase a 
 });
 test('successful GPS clears saved city; timeout preserves last area with explanation',async()=>{
  const h=harness();h.saved.set('airly-city',{name:'Penang'});const first=h.run('locate()');await h.position().success(gps());await first;assert.equal(h.saved.get('airly-city'),null);
- const second=h.run('locate()');await h.position().failure({code:3});await second;assert.equal(h.run('locationError'),'geoTimeout');assert.equal(h.run('userLocation.lat'),3.0738);
+ const second=h.run('locate()');await h.position().failure({code:3});assert.equal(h.position().options.enableHighAccuracy,false);await h.position().failure({code:3});await second;assert.equal(h.run('locationError'),'geoTimeout');assert.equal(h.run('userLocation.lat'),3.0738);
+});
+test('precise fix timing out falls back to the coarse browser fix before IP',async()=>{
+ const h=harness();const first=h.run('locate()');await h.position().failure({code:2});
+ assert.equal(h.position().options.enableHighAccuracy,false);await h.position().success(gps());await first;
+ assert.equal(h.run('userLocation.source'),'gps');assert.equal(h.run('userLocation.lat'),3.0738);
+});
+test('denied permission skips the coarse retry',async()=>{
+ const h=harness();const first=h.run('locate()');const before=h.position();await before.failure({code:1});await first;
+ assert.equal(h.position().options.enableHighAccuracy,true);assert.equal(h.run('locationError'),'locBlocked');
 });

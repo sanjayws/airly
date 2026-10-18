@@ -42,6 +42,8 @@ const logFailure = (route, code) => console.warn(JSON.stringify({event:'request_
 const SEA_BOUNDS = '-11,92,29,141';
 const SW_JS = "self.addEventListener('install',()=>self.skipWaiting());self.addEventListener('activate',e=>e.waitUntil(self.clients.claim()));self.addEventListener('notificationclick',e=>{e.notification.close();e.waitUntil(self.clients.matchAll({type:'window'}).then(c=>c[0]?c[0].focus():self.clients.openWindow('/')))});self.addEventListener('push',e=>{let d={};try{d=e.data.json()}catch{}e.waitUntil(self.registration.showNotification(d.title||'Airly',{body:d.body||''}))});";
 const UPSTREAM_TIMEOUT = 8000;
+const FRESH_MS = 3 * 3600000; // matches the dashboard's fresh/stale boundary
+const COVERAGE_KM = 100; // beyond this a station does not describe the user's air
 
 export default {
   async fetch(request, env, ctx) {
@@ -163,11 +165,15 @@ async function malaysiaAir(request, env) {
   try {
     const stations = await malaysiaStations();
     if (p.has('scope')) return json(bounds ? stations.filter(s=>s.lat>=bounds[0] && s.lat<=bounds[2] && s.lon>=bounds[1] && s.lon<=bounds[3]) : stations);
-    const station = uid ? stations.find(s=>s.uid===uid) : stations.slice().sort((a,b)=>stationDistance(lat??3.139,lon??101.687,a)-stationDistance(lat??3.139,lon??101.687,b))[0];
+    const byDistance = (list) => list.slice().sort((a,b)=>stationDistance(lat??3.139,lon??101.687,a)-stationDistance(lat??3.139,lon??101.687,b));
+    // A station that stopped reporting must not outrank a working neighbour: prefer the
+    // nearest reading from the last 3 hours (the client's freshness limit), and only fall back to a stale one.
+    const recent = stations.filter(s=>Date.parse(s.time)>Date.now()-FRESH_MS);
+    const station = uid ? stations.find(s=>s.uid===uid) : byDistance(recent.length?recent:stations)[0];
     if (!station) return json({ error: 'This DOE station has no available API reading', code: 'NO_READING' }, 502);
     // IP country can be wrong (e.g. a VPN). Never imply a distant Malaysian station
     // measures air at a GPS position on another continent.
-    if (!uid && lat !== null && stationDistance(lat,lon,station)>200) return json({error:'No Malaysia API station covers this area. Select US AQI for worldwide stations.',code:'NO_COVERAGE'},422);
+    if (!uid && lat !== null && stationDistance(lat,lon,station)>COVERAGE_KM) return json({error:'No Malaysia API station covers this area. Select US AQI for worldwide stations.',code:'NO_COVERAGE'},422);
     return json(station);
   } catch { logFailure('air','DOE_UNAVAILABLE'); return json({ error: 'Malaysia DOE API readings are temporarily unavailable. Try again or select US AQI in settings.', code: 'DOE_UNAVAILABLE' }, 502); }
 }
@@ -207,10 +213,30 @@ async function waqiAir(request, env) {
     }
     // Preserve coordinates for station matching. No artificial kilometre rounding.
     const target = uid ? '@'+uid : lat !== null ? 'geo:'+lat+';'+lon : 'geo:3.139;101.687';
-    const station=await waqiStation(target,env,uid);
-    if(!uid&&lat!==null&&stationDistance(lat,lon,station)>200)return json({error:'No nearby station reading is available for these coordinates',code:'NO_COVERAGE'},422);
+    // WAQI's geo feed picks its own "nearest" station, which can be silent or distant.
+    // For coordinates, rank real stations by distance and prefer a fresh reading.
+    const station=(!uid&&lat!==null&&await nearestWaqi(lat,lon,env))||await waqiStation(target,env,uid);
+    if(!uid&&lat!==null&&stationDistance(lat,lon,station)>COVERAGE_KM)return json({error:'No nearby station reading is available for these coordinates',code:'NO_COVERAGE'},422);
     return json(station);
   } catch { logFailure('air','UPSTREAM_UNAVAILABLE'); return json({ error: 'Air quality data is temporarily unavailable', code: 'UPSTREAM_UNAVAILABLE' }, 502); }
+}
+async function nearestWaqi(lat, lon, env) {
+  try {
+    for (const span of [0.3, 1.2]) {
+      const box = [Math.max(-90,lat-span), Math.max(-180,lon-span), Math.min(90,lat+span), Math.min(180,lon+span)].map(x=>x.toFixed(4)).join(',');
+      const result = await fetchJson('https://api.waqi.info/v2/map/bounds?latlng='+box+'&networks=all&token='+encodeURIComponent(env.AQICN_TOKEN));
+      if (result.status !== 'ok' || !Array.isArray(result.data)) return null;
+      const near = result.data.map(s=>({uid:number(s.uid),lat:number(s.lat),lon:number(s.lon)}))
+        .filter(s=>Number.isSafeInteger(s.uid)&&s.uid>0&&s.lat!==null&&s.lon!==null&&Math.abs(s.lat)<=90&&Math.abs(s.lon)<=180)
+        .map(s=>({...s,km:stationDistance(lat,lon,s)})).filter(s=>s.km<=COVERAGE_KM).sort((a,b)=>a.km-b.km).slice(0,6);
+      if (!near.length) continue;
+      const details = (await Promise.all(near.map(s=>waqiStation('@'+s.uid,env,s.uid).catch(()=>null)))).filter(Boolean);
+      const fresh = details.filter(d=>Date.parse(d.time)>Date.now()-FRESH_MS&&Date.parse(d.time)<Date.now()+600000);
+      const pick = (fresh.length?fresh:details).sort((a,b)=>stationDistance(lat,lon,a)-stationDistance(lat,lon,b))[0];
+      if (pick) return pick;
+    }
+  } catch { /* fall back to WAQI's own geo lookup */ }
+  return null;
 }
 async function waqiStation(target,env,uid=null) {
   const result=await fetchJson('https://api.waqi.info/feed/'+target+'/?token='+encodeURIComponent(env.AQICN_TOKEN));
